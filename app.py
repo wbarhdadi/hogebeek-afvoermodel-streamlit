@@ -22,6 +22,7 @@ from hydrology import (
     DIRECTION_MAP, accumulate_travel_time, compute_effective_recharge,
     route_Q_channel, tv_convolve_next,
 )
+from scenario import ScenarioSetup, save_scenario_setup, saved_scenario_setup
 
 # Probeer pywaterinfo te importeren
 try:
@@ -131,7 +132,14 @@ if "logs" not in st.session_state:
 # ============================================================
 
 with st.sidebar:
-    st.header("Invoerbestanden")
+    st.header("Scenario instellen")
+    retained_setup = saved_scenario_setup(st.session_state)
+    scenario_name = st.text_input(
+        "Scenarionaam *",
+        value=retained_setup.name if retained_setup else "",
+        help="De gekozen invoer blijft tijdens deze browsersessie bij deze naam bewaard.",
+    )
+    st.subheader("1. Ruimtelijke invoer")
 
     geodata_file = st.file_uploader("Hogebeek_geodata.parquet", type=["parquet"])
     catchments_file = st.file_uploader("catchments.gpkg", type=["gpkg"])
@@ -146,14 +154,8 @@ with st.sidebar:
         "**Maatregelen shapefiles (optioneel)** – je mag meerdere shapefiles uploaden "
         "(punten, lijnen, polygonen), telkens met alle bijhorende bestanden."
     )
-    maatregelen_files = st.file_uploader(
-        "maatregelen.* (alle shapefile-bestanden, optioneel; meerdere toegestaan)",
-        accept_multiple_files=True,
-    )
-
     st.markdown("---")
-    st.markdown("---")
-    st.subheader("Neerslag")
+    st.subheader("2. Neerslag")
     rainfall_source = st.radio("Bron", ["Waterinfo (VMM)", "CSV upload"])
     # CSV has no trustworthy metadata, so the uploader must specify its unit.
     # Waterinfo does: its unit is read from ts_unitsymbol during the download.
@@ -198,20 +200,63 @@ with st.sidebar:
     st.caption("De modeltijdstap moet een geheel veelvoud zijn van het interval in de neerslagreeks.")
 
     st.markdown("---")
-    st.subheader("Modelparameters")
-
-    slope_factor = st.number_input("Factor helling (D8slope)", value=1.0)
-    manning_factor = st.number_input("Factor Manning n", value=1.0)
-    runoff_factor = st.number_input("Factor runoff (%)", value=1.0)
+    st.subheader("3. Maatregelen en modelinstelling")
+    maatregelen_files = st.file_uploader(
+        "Maatregelen (shapefile-bestanden, optioneel)",
+        accept_multiple_files=True,
+        help="Upload alle bijhorende bestanden voor punten, lijnen of polygonen.",
+    )
     A_threshold = st.number_input(
         "Drempel stroomopwaarts gebied A_threshold [m²] (kanaalcel)",
         value=100000.0,
         min_value=0.0,
     )
+    st.caption(
+        "Dit bepaalt vanaf welke afwaterende oppervlakte cellen als kanaal tellen: "
+        "lager toont een fijner kanaalnetwerk, hoger alleen grotere waterlopen."
+    )
+
+    if maatregelen_files:
+        measure_layers = [
+            uploaded_file.name
+            for uploaded_file in maatregelen_files
+            if uploaded_file.name.lower().endswith(".shp")
+        ]
+        st.caption(
+            f"Maatregelen: {len(measure_layers)} laag/lagen en "
+            f"{len(maatregelen_files)} shapefile-bestanden: "
+            + ", ".join(measure_layers or [uploaded_file.name for uploaded_file in maatregelen_files])
+        )
+    else:
+        st.caption("Maatregelen: geen bestanden toegevoegd.")
 
     st.markdown("---")
+    st.subheader("4. Controleren en uitvoeren")
     export_depths = st.checkbox("Maximale waterdiepte per stroomgebied exporteren (GeoTIFF)", value=True)
-    run_button = st.button("Model draaien")
+    validation_items = {
+        "Scenarionaam": bool(scenario_name.strip()),
+        "Geodata": geodata_file is not None,
+        "Stroomgebieden": catchments_file is not None,
+        "Inlets": inlets_file is not None,
+        "Neerslag": rainfall_source == "Waterinfo (VMM)" or rainfall_csv_file is not None,
+    }
+    st.caption(
+        " · ".join(
+            f"{'✓' if complete else '○'} {label}"
+            for label, complete in validation_items.items()
+        )
+    )
+    if scenario_name.strip():
+        st.caption(f"Klaar om scenario '{scenario_name.strip()}' uit te voeren.")
+    else:
+        st.caption("Geef eerst een scenarionaam op; die is verplicht om uit te voeren.")
+    if retained_setup:
+        st.caption(
+            f"Opgeslagen sessiescenario: '{retained_setup.name}' "
+            f"({retained_setup.rainfall_source}, {retained_setup.timestep_minutes} min). "
+            "Pas bovenstaande invoer aan en voer opnieuw uit; uploads blijven in deze sessie beschikbaar."
+        )
+    run_button = st.button("Scenario controleren en uitvoeren")
 
 
 col_left, col_right = st.columns([2, 1])
@@ -256,7 +301,8 @@ with col_right:
             ],
         }
     )
-    st.table(maatregelen_info)
+    # The uploaded-file summary next to the configuration is more useful than
+    # keeping this static reference table beside every results view.
 
     plot_container = st.empty()
     download_container = st.empty()
@@ -1189,7 +1235,25 @@ def read_maatregelen_from_uploads(files: List, label: str) -> Optional[gpd.GeoDa
 
 if run_button:
     try:
-        if geodata_file is None or catchments_file is None or inlets_file is None:
+        setup_error = save_scenario_setup(
+            st.session_state,
+            ScenarioSetup(
+                name=scenario_name,
+                rainfall_source=rainfall_source,
+                timestep_minutes=int(timestep_minutes),
+                a_threshold_m2=float(A_threshold),
+                uploaded_inputs={
+                    "geodata": geodata_file,
+                    "catchments": catchments_file,
+                    "inlets": inlets_file,
+                    "rainfall": rainfall_csv_file,
+                    "measures": maatregelen_files,
+                },
+            ),
+        )
+        if setup_error:
+            st.error(setup_error)
+        elif geodata_file is None or catchments_file is None or inlets_file is None:
             st.error("Upload eerst geodata, catchments en `inlets_pts.gpkg`.")
         elif rainfall_source == "CSV upload" and rainfall_csv_file is None:
             st.error("Upload een neerslag-CSV of kies Waterinfo als bron.")
