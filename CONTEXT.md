@@ -8,6 +8,26 @@ This context models rainfall-driven flow and water levels in coupled Hoge Beek s
 A spatially distributed part of the Hoge Beek system with one outlet and, optionally, upstream inlet(s).
 _Avoid_: basin, area
 
+**Model timestep**:
+A fixed, half-open time interval over which rainfall depth and outflow volume are accumulated; its timestamp marks the interval start.
+_Avoid_: time point, output timestamp
+
+**Effective water volume**:
+The part of rainfall volume admitted to spatial routing after applying a cell's runoff percentage, expressed in cubic metres.
+_Avoid_: effective recharge, discharge
+
+**Travel-time queue**:
+Effective water that is travelling through a subcatchment and has not yet reached its outlet storage.
+_Avoid_: unit-response matrix, outlet storage
+
+**Outlet storage**:
+Water that has completed spatial travel to a subcatchment outlet but has not yet left through its outlet rule.
+_Avoid_: travel-time queue, flooded volume
+
+**Subcatchment connection**:
+The shared boundary where one subcatchment's outflow volume becomes another subcatchment's inlet volume.
+_Avoid_: transfer reservoir, channel reach
+
 **Rainfall depth**:
 Rainfall accumulated over one stated interval, expressed in millimetres. It is the rainfall quantity consumed by the model.
 _Avoid_: rainfall intensity, precipitation rate

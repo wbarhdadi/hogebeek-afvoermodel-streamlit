@@ -1,5 +1,9 @@
 # Architecture and model flow
 
+The accepted hydrological rules, timestep semantics, state transitions, and
+mass-conservation boundaries are defined in the
+[conceptual hydrological model](conceptual-hydrological-model.md).
+
 The Streamlit page is deliberately a thin orchestration layer. It reads files and user choices, invokes the model workflow, and renders results. The numerical routing implementation remains in `app.py` for now; moving it wholesale would make this quick improvement riskier than useful.
 
 ```text
