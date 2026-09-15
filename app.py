@@ -385,15 +385,6 @@ def render_results_overview(results: dict):
     ):
         metric_columns[metric_column].metric(label, f"{total_metrics.get(column, 0.0):.2f} ha")
 
-    st.markdown("#### Hydrograven per terminale uitlaat")
-    for catchment_id in results["catchment_ids"]:
-        st.markdown(f"##### Hydrograaf - terminale uitlaat {catchment_id}")
-        hydrograph, _ = build_detail_charts(
-            results["rainfall"], results["discharges"], results["waterlevels"],
-            catchment_id, results["timestep_minutes"],
-        )
-        st.altair_chart(hydrograph, width="stretch")
-
     st.markdown("#### Gerangschikte subcatchments")
     subcatchments["flooded_area_at_or_above_0_01m_ha"] = subcatchments[
         list(FLOODED_AREA_COLUMNS)
@@ -409,6 +400,53 @@ def render_results_overview(results: dict):
             "peak_discharge_m3s": "Piekafvoer [m³/s]",
         },
     )
+
+
+def render_result_navigation(results: dict):
+    """Render either the all-subcatchment overview or one focused detail view."""
+    detail_discharges = results.get("detail_discharges", results["discharges"])
+    detail_ids = sorted(
+        int(catchment_id)
+        for catchment_id in results["summary"].loc[
+            results["summary"]["summary_scope"] == "subcatchment", "catchment_id"
+        ]
+        if f"discharge_catchment_{catchment_id}_m3s" in detail_discharges
+    )
+    selected_value = st.session_state.get("selected_result_catchment")
+    selected_catchment = int(selected_value) if selected_value is not None else None
+
+    if selected_catchment not in detail_ids:
+        st.session_state["selected_result_catchment"] = None
+        selected_catchment = None
+
+    if selected_catchment is None:
+        render_results_overview(results)
+        if detail_ids:
+            st.selectbox(
+                "Selecteer een subcatchment",
+                [str(catchment_id) for catchment_id in detail_ids],
+                index=None,
+                placeholder="Kies een subcatchment voor detailresultaten",
+                key="selected_result_catchment",
+            )
+        else:
+            st.info("Geen subcatchments met een terminale uitlaat gevonden.")
+        return
+
+    st.session_state["selected_result_catchment"] = selected_catchment
+    summary = results["summary"].set_index("catchment_id").loc[selected_catchment]
+    st.button(
+        "Terug naar alle subcatchments",
+        on_click=lambda: st.session_state.update(selected_result_catchment=None),
+    )
+    st.markdown(f"#### Hydrogram - subcatchment {selected_catchment}")
+    hydrograph, _ = build_detail_charts(
+        results["rainfall"], detail_discharges, results["waterlevels"],
+        selected_catchment, results["timestep_minutes"],
+    )
+    st.altair_chart(hydrograph, width="stretch")
+    st.markdown("#### Overstroomd areaal per waterdiepteklasse")
+    render_event_summary_metrics(summary, results["rainfall_diagnostics"].total_depth_mm)
 
 
 # Toon bestaande logs (bij her-run)
@@ -1467,12 +1505,16 @@ if run_button:
                 pixel_area_m2=L**2,
                 terminal_outlet_ids=set(terminal_outlet_ids),
             )
+            detail_discharges = pd.DataFrame({"datetime": pd.to_datetime(times)})
+            for catchment_id, volumes in catchment_outflow_volumes.items():
+                detail_discharges[f"discharge_catchment_{catchment_id}_m3s"] = volumes / T
             df_rf = rf_timeseries.rename(
                 columns={"datum": "datetime", "rf": "rainfall_depth_mm"}
             )
             st.session_state["simulation_results"] = {
                 "catchment_ids": terminal_outlet_ids,
                 "discharges": df_Q,
+                "detail_discharges": detail_discharges,
                 "waterlevels": df_H,
                 "summary": df_summary,
                 "rainfall": df_rf,
@@ -1486,9 +1528,10 @@ if run_button:
                 },
                 "raster_transforms": {cid: inputs[cid]["transform"] for cid in catchment_ids_sorted},
             }
+            st.session_state["selected_result_catchment"] = None
 
             with plot_container.container():
-                render_results_overview(st.session_state["simulation_results"])
+                render_result_navigation(st.session_state["simulation_results"])
                 if False and terminal_outlet_ids:
                     selected_cid = st.selectbox(
                         "Terminale uitlaat", terminal_outlet_ids, key="initial_result_catchment"
@@ -1626,32 +1669,7 @@ if run_button:
 if "simulation_results" in st.session_state and not run_button:
     results = st.session_state["simulation_results"]
     with plot_container.container():
-        render_results_overview(results)
-        if False and results["catchment_ids"]:
-            selected_cid = st.selectbox(
-                "Terminale uitlaat", results["catchment_ids"], key="result_catchment"
-            )
-            summary = results["summary"].set_index("catchment_id").loc[selected_cid]
-            render_event_summary_metrics(summary, results["rainfall_diagnostics"].total_depth_mm)
-            hydrograph, waterlevel_chart = build_detail_charts(
-                results["rainfall"], results["discharges"], results["waterlevels"],
-                selected_cid, results["timestep_minutes"],
-            )
-            st.altair_chart(hydrograph, width="stretch")
-            st.altair_chart(waterlevel_chart, width="stretch")
-            if selected_cid in results.get("maximum_water_depths", {}):
-                selected_transform = results["raster_transforms"][selected_cid]
-                st.altair_chart(
-                    build_waterdepth_map(
-                        results["maximum_water_depths"][selected_cid],
-                        selected_transform.c,
-                        selected_transform.f,
-                        abs(selected_transform.a),
-                    ),
-                    width="stretch",
-                )
-        elif False:
-            st.info("Geen stroomgebieden gevonden in de inputs.")
+        render_result_navigation(results)
 
     if "results_export" in st.session_state:
         with download_container:

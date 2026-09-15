@@ -6,11 +6,11 @@ from streamlit.testing.v1 import AppTest
 
 
 class ResultsViewTests(unittest.TestCase):
-    def test_persisted_results_show_map_free_overview_and_terminal_hydrographs(self):
+    def test_user_can_select_a_subcatchment_and_return_to_the_overview_after_a_rerun(self):
         times = pd.date_range("2025-01-01", periods=2, freq="h")
         app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
         app.session_state["simulation_results"] = {
-            "catchment_ids": [1, 2],
+            "catchment_ids": [2],
             "discharges": pd.DataFrame({
                 "datetime": times,
                 "discharge_catchment_1_m3s": [0.0, 1.0],
@@ -34,16 +34,28 @@ class ResultsViewTests(unittest.TestCase):
 
         app.run()
 
-        self.assertEqual(len(app.get("vega_lite_chart")), 2)
+        self.assertIn("Selecteer een subcatchment", [selectbox.label for selectbox in app.selectbox])
         self.assertIn(
             "Totaal overstroomd areaal (>= 0,01 m; som van subcatchments)",
             [metric.label for metric in app.metric],
         )
         markdown_values = [markdown.value for markdown in app.markdown]
-        self.assertTrue(any("Hydrograaf - terminale uitlaat 1" in value for value in markdown_values))
-        self.assertTrue(any("Hydrograaf - terminale uitlaat 2" in value for value in markdown_values))
+        self.assertTrue(any("Gerangschikte subcatchments" in value for value in markdown_values))
         self.assertEqual(len(app.get("map")), 0)
         self.assertIn("modelschattingen", " ".join(caption.value for caption in app.caption))
+
+        next(selectbox for selectbox in app.selectbox if selectbox.label == "Selecteer een subcatchment").select("1").run()
+
+        self.assertEqual(app.session_state["selected_result_catchment"], 1)
+        self.assertEqual(len(app.get("vega_lite_chart")), 1)
+        self.assertTrue(any("Hydrogram - subcatchment 1" in value for value in [markdown.value for markdown in app.markdown]))
+        self.assertEqual(sum(metric.value.endswith("ha") for metric in app.metric), 5)
+        self.assertEqual(len(app.get("map")), 0)
+
+        next(button for button in app.button if button.label == "Terug naar alle subcatchments").click().run()
+
+        self.assertIsNone(app.session_state["selected_result_catchment"])
+        self.assertTrue(any("Gerangschikte subcatchments" in value for value in [markdown.value for markdown in app.markdown]))
 
 
 if __name__ == "__main__":
