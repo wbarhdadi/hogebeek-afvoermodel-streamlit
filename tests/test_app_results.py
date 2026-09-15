@@ -22,6 +22,10 @@ class ResultsViewTests(unittest.TestCase):
         app.run()
 
         self.assertEqual(len(app.get("vega_lite_chart")), 2)
+        self.assertIn("Piekafvoer", [metric.label for metric in app.metric])
+        self.assertIn("Maximale waterdiepte", [metric.label for metric in app.metric])
+        self.assertIn("Tijd tot piek", [metric.label for metric in app.metric])
+        self.assertIn("modelschattingen", " ".join(caption.value for caption in app.caption))
 
 
 if __name__ == "__main__":

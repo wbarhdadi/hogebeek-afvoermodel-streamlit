@@ -17,7 +17,7 @@ from rainfall import (
     waterinfo_value_kind as detect_waterinfo_value_kind,
 )
 from reporting import build_output_tables
-from visualization import build_detail_charts
+from visualization import build_detail_charts, build_waterdepth_map
 from hydrology import (
     DIRECTION_MAP, accumulate_travel_time, compute_effective_recharge,
     route_Q_channel, tv_convolve_next,
@@ -277,6 +277,23 @@ def log(message: str):
     """Voeg één stap toe en herteken het logboek."""
     st.session_state["logs"].append(str(message))
     render_logs()
+
+
+def render_event_summary_metrics(summary: pd.Series, total_rainfall_mm: float):
+    """Show stakeholder-facing event estimates for the selected subcatchment."""
+    time_to_peak = summary.get("time_to_peak_minutes", np.nan)
+    time_to_peak_label = "Niet beschikbaar" if not np.isfinite(time_to_peak) else f"{time_to_peak:.0f} min"
+    first_row = st.columns(3)
+    first_row[0].metric("Totale neerslag", f"{total_rainfall_mm:.1f} mm")
+    first_row[1].metric("Piekafvoer", f"{summary['peak_discharge_m3s']:.3g} m³/s")
+    first_row[2].metric("Maximale waterdiepte", f"{summary.get('max_water_depth_m', np.nan):.2f} m")
+    second_row = st.columns(3)
+    second_row[0].metric("Overstroomd oppervlak ≥0,01 m", f"{summary.get('flooded_area_0_01m_ha', np.nan):.2f} ha")
+    second_row[1].metric("Overstroomd oppervlak ≥0,10 m", f"{summary.get('flooded_area_0_10m_ha', np.nan):.2f} ha")
+    second_row[2].metric("Tijd tot piek", time_to_peak_label)
+    st.caption(
+        "Deze uitkomsten zijn modelschattingen voor scenarioverkenning, geen lokale voorspellingen."
+    )
 
 
 # Toon bestaande logs (bij her-run)
@@ -1307,7 +1324,13 @@ if run_button:
             # converts them once to stakeholder-facing discharge [m3/s].
             catchment_ids_sorted = sorted(int(c) for c in catchments.uitstroompunt_nummer.values)
             df_Q, df_H, df_summary = build_output_tables(
-                times, catchment_outflow_volumes, catchment_waterlevels, T
+                times,
+                catchment_outflow_volumes,
+                catchment_waterlevels,
+                T,
+                rainfall_depths_mm=rf_timeseries["rf"].to_numpy(),
+                terrain_by_catchment={cid: inputs[cid]["dtm_catchment"] for cid in catchment_ids_sorted},
+                pixel_area_m2=L**2,
             )
             df_rf = rf_timeseries.rename(
                 columns={"datum": "datetime", "rf": "rainfall_depth_mm"}
@@ -1320,6 +1343,13 @@ if run_button:
                 "rainfall": df_rf,
                 "rainfall_diagnostics": rf_diagnostics,
                 "timestep_minutes": int(timestep_minutes),
+                "maximum_water_depths": {
+                    cid: np.maximum(
+                        float(np.nanmax(catchment_waterlevels[cid])) - inputs[cid]["dtm_catchment"], 0.0
+                    )
+                    for cid in catchment_ids_sorted
+                },
+                "raster_transforms": {cid: inputs[cid]["transform"] for cid in catchment_ids_sorted},
             }
 
             with plot_container.container():
@@ -1329,10 +1359,7 @@ if run_button:
                         "Stroomgebied", catchment_ids_sorted, key="initial_result_catchment"
                     )
                     summary = df_summary.set_index("catchment_id").loc[selected_cid]
-                    metric_a, metric_b, metric_c = st.columns(3)
-                    metric_a.metric("Totale neerslag", f"{rf_diagnostics.total_depth_mm:.1f} mm")
-                    metric_b.metric("Piekafvoer", f"{summary['peak_discharge_m3s']:.3g} m³/s")
-                    metric_c.metric("Maximaal waterpeil", f"{summary['max_water_level_m_taw']:.2f} m TAW")
+                    render_event_summary_metrics(summary, rf_diagnostics.total_depth_mm)
                     if rf_diagnostics.peak_intensity_mmh > 100:
                         st.warning(
                             f"Piekintensiteit is {rf_diagnostics.peak_intensity_mmh:.1f} mm/h. "
@@ -1361,6 +1388,21 @@ if run_button:
                     )
                     st.altair_chart(hydrograph, width="stretch")
                     st.altair_chart(waterlevel_chart, width="stretch")
+                    selected_depths = np.maximum(
+                        float(np.nanmax(catchment_waterlevels[selected_cid]))
+                        - inputs[selected_cid]["dtm_catchment"],
+                        0.0,
+                    )
+                    selected_transform = inputs[selected_cid]["transform"]
+                    st.altair_chart(
+                        build_waterdepth_map(
+                            selected_depths,
+                            selected_transform.c,
+                            selected_transform.f,
+                            abs(selected_transform.a),
+                        ),
+                        width="stretch",
+                    )
                     st.markdown("#### Samenvatting per stroomgebied")
                     st.dataframe(df_summary, hide_index=True, width="stretch")
 
@@ -1465,15 +1507,23 @@ if "simulation_results" in st.session_state and not run_button:
                 "Stroomgebied", results["catchment_ids"], key="result_catchment"
             )
             summary = results["summary"].set_index("catchment_id").loc[selected_cid]
-            metric_a, metric_b, metric_c = st.columns(3)
-            metric_a.metric("Totale neerslag", f"{results['rainfall_diagnostics'].total_depth_mm:.1f} mm")
-            metric_b.metric("Piekafvoer", f"{summary['peak_discharge_m3s']:.3g} m3/s")
-            metric_c.metric("Maximaal waterpeil", f"{summary['max_water_level_m_taw']:.2f} m TAW")
+            render_event_summary_metrics(summary, results["rainfall_diagnostics"].total_depth_mm)
             hydrograph, waterlevel_chart = build_detail_charts(
                 results["rainfall"], results["discharges"], results["waterlevels"],
                 selected_cid, results["timestep_minutes"],
             )
             st.altair_chart(hydrograph, width="stretch")
             st.altair_chart(waterlevel_chart, width="stretch")
+            if selected_cid in results.get("maximum_water_depths", {}):
+                selected_transform = results["raster_transforms"][selected_cid]
+                st.altair_chart(
+                    build_waterdepth_map(
+                        results["maximum_water_depths"][selected_cid],
+                        selected_transform.c,
+                        selected_transform.f,
+                        abs(selected_transform.a),
+                    ),
+                    width="stretch",
+                )
         else:
             st.info("Geen stroomgebieden gevonden in de inputs.")
