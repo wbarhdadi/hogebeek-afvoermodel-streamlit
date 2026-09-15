@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+
+geopandas
+rasterio
+
+pywaterinfo
+
+shapely
+fiona
+pyproj
