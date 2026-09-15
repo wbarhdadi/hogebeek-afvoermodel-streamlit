@@ -54,12 +54,14 @@ def build_output_tables(
         if terminal_outlet_ids is None or catchment_id in terminal_outlet_ids:
             discharges[f"discharge_catchment_{catchment_id}_m3s"] = discharge_m3s
             waterlevels[f"water_level_catchment_{catchment_id}_m_taw"] = levels
+        finite_levels = levels[np.isfinite(levels)]
+        maximum_level = float(finite_levels.max()) if finite_levels.size else np.nan
         row = {
             "catchment_id": catchment_id,
             "summary_scope": "subcatchment",
             "total_outflow_m3": float(volumes.sum()),
             "peak_discharge_m3s": float(discharge_m3s.max(initial=0.0)),
-            "max_water_level_m_taw": float(np.nanmax(levels)),
+            "max_water_level_m_taw": maximum_level,
         }
         if rainfall_depths_mm is not None:
             row["time_to_peak_minutes"] = np.nan
@@ -69,7 +71,7 @@ def build_output_tables(
                     max(0, peak_index - rainfall_start) * timestep_seconds / 60.0
                 )
         if terrain_by_catchment is not None and pixel_area_m2 is not None:
-            maximum_depth = np.maximum(float(np.nanmax(levels)) - terrain_by_catchment[catchment_id], 0.0)
+            maximum_depth = np.maximum(maximum_level - terrain_by_catchment[catchment_id], 0.0)
             valid_depths = maximum_depth[np.isfinite(maximum_depth)]
             row["max_water_depth_m"] = float(valid_depths.max(initial=0.0))
             for lower_bound, upper_bound, column in FLOODED_DEPTH_CLASSES:
