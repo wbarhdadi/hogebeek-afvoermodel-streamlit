@@ -1322,7 +1322,7 @@ if run_button:
                 "timestep_minutes": int(timestep_minutes),
             }
 
-            with plot_container:
+            with plot_container.container():
                 st.markdown("#### Simulatieresultaten")
                 if catchment_ids_sorted:
                     selected_cid = st.selectbox(
@@ -1359,10 +1359,10 @@ if run_button:
                     hydrograph, waterlevel_chart = build_detail_charts(
                         df_rf, df_Q, df_H, selected_cid, int(timestep_minutes)
                     )
-                    st.altair_chart(hydrograph, use_container_width=True)
-                    st.altair_chart(waterlevel_chart, use_container_width=True)
+                    st.altair_chart(hydrograph, width="stretch")
+                    st.altair_chart(waterlevel_chart, width="stretch")
                     st.markdown("#### Samenvatting per stroomgebied")
-                    st.dataframe(df_summary, hide_index=True, use_container_width=True)
+                    st.dataframe(df_summary, hide_index=True, width="stretch")
 
                     # A readable spatial overview: one point per catchment,
                     # coloured/scaled by the maximum simulated water depth.
@@ -1396,10 +1396,10 @@ if run_button:
                         )
                         st.map(map_df, latitude="latitude", longitude="longitude",
                                color="depth_color", size="max_waterdepth_m",
-                               zoom=12, use_container_width=True)
+                               zoom=12, width="stretch")
                         st.caption("Kleurklasse: ≤0,10 m · ≤0,50 m · ≤1,00 m · >1,00 m")
                         st.dataframe(map_df.drop(columns=["latitude", "longitude", "depth_color"]),
-                                     hide_index=True, use_container_width=True)
+                                     hide_index=True, width="stretch")
                 else:
                     st.info("Geen stroomgebieden gevonden in de inputs.")
 
@@ -1458,7 +1458,7 @@ if run_button:
 
 if "simulation_results" in st.session_state and not run_button:
     results = st.session_state["simulation_results"]
-    with plot_container:
+    with plot_container.container():
         st.markdown("#### Simulatieresultaten")
         if results["catchment_ids"]:
             selected_cid = st.selectbox(
@@ -1473,7 +1473,7 @@ if "simulation_results" in st.session_state and not run_button:
                 results["rainfall"], results["discharges"], results["waterlevels"],
                 selected_cid, results["timestep_minutes"],
             )
-            st.altair_chart(hydrograph, use_container_width=True)
-            st.altair_chart(waterlevel_chart, use_container_width=True)
+            st.altair_chart(hydrograph, width="stretch")
+            st.altair_chart(waterlevel_chart, width="stretch")
         else:
             st.info("Geen stroomgebieden gevonden in de inputs.")
