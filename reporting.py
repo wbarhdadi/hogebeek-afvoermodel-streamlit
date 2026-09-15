@@ -17,6 +17,7 @@ FLOODED_DEPTH_CLASSES = (
     (1.00, 2.00, "flooded_area_1_to_2m_ha"),
     (2.00, np.inf, "flooded_area_over_2m_ha"),
 )
+FLOODED_AREA_COLUMNS = tuple(depth_class[2] for depth_class in FLOODED_DEPTH_CLASSES)
 
 
 def build_output_tables(

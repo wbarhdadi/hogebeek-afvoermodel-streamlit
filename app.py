@@ -16,13 +16,16 @@ from rainfall import (
     DEPTH_COLUMN, INTENSITY_COLUMN, prepare_rainfall, rainfall_diagnostics,
     waterinfo_value_kind as detect_waterinfo_value_kind,
 )
-from reporting import build_output_tables, build_results_zip
+from reporting import FLOODED_AREA_COLUMNS, build_output_tables, build_results_zip
 from visualization import build_detail_charts, build_waterdepth_map
 from hydrology import (
     DIRECTION_MAP, accumulate_travel_time, compute_effective_recharge,
     route_Q_channel, tv_convolve_next,
 )
-from scenario import ScenarioSetup, save_scenario_setup, saved_scenario_setup
+from scenario import (
+    ScenarioSetup, build_scenario_comparison, input_differences, save_baseline,
+    save_comparison, save_scenario_setup, saved_scenario_setup, snapshot_inputs,
+)
 
 # Probeer pywaterinfo te importeren
 try:
@@ -133,6 +136,10 @@ if "logs" not in st.session_state:
 
 with st.sidebar:
     st.header("Scenario instellen")
+    run_kind = st.radio(
+        "Uitvoering", ["Basisscenario", "Vergelijkingsscenario"],
+        help="Voer eerst een basis zonder maatregelen uit, daarna één genoemd scenario met maatregelen.",
+    )
     retained_setup = saved_scenario_setup(st.session_state)
     scenario_name = st.text_input(
         "Scenarionaam *",
@@ -206,6 +213,8 @@ with st.sidebar:
         accept_multiple_files=True,
         help="Upload alle bijhorende bestanden voor punten, lijnen of polygonen.",
     )
+    if run_kind == "Vergelijkingsscenario" and "baseline" not in st.session_state:
+        st.caption("Voer eerst een basisscenario uit om hiermee te kunnen vergelijken.")
     A_threshold = st.number_input(
         "Drempel stroomopwaarts gebied A_threshold [m²] (kanaalcel)",
         value=100000.0,
@@ -351,15 +360,6 @@ def render_event_summary_metrics(summary: pd.Series, total_rainfall_mm: float):
     )
 
 
-FLOODED_AREA_COLUMNS = (
-    "flooded_area_0_01_to_0_25m_ha",
-    "flooded_area_0_25_to_0_50m_ha",
-    "flooded_area_0_50_to_1m_ha",
-    "flooded_area_1_to_2m_ha",
-    "flooded_area_over_2m_ha",
-)
-
-
 def render_results_overview(results: dict):
     """Render the map-free, catchment-wide scenario result overview."""
     summary = results["summary"]
@@ -402,8 +402,41 @@ def render_results_overview(results: dict):
     )
 
 
+def render_scenario_comparison():
+    """Render the retained baseline-to-measure comparison when both runs exist."""
+    baseline = st.session_state.get("baseline")
+    comparison = st.session_state.get("comparison")
+    if not baseline or not comparison:
+        return
+    overview = build_scenario_comparison(baseline, comparison)
+    st.markdown(f"#### Vergelijking: {baseline['name']} → {comparison['name']}")
+    if overview["input_differences"]:
+        st.warning(
+            "Niet-equivalente invoer: " + ", ".join(overview["input_differences"])
+        )
+        return
+    st.caption("Piekafvoer per terminale uitlaat [m³/s].")
+    st.dataframe(overview["terminal_peaks"], width="stretch")
+    changes = overview["subcatchments"].reset_index()
+    if not changes.empty:
+        st.caption("Absolute verschillen in overstroomd areaal per waterdiepteklasse [ha].")
+        st.dataframe(changes, hide_index=True, width="stretch")
+
+
 def render_result_navigation(results: dict):
     """Render either the all-subcatchment overview or one focused detail view."""
+    baseline = st.session_state.get("baseline")
+    comparison = st.session_state.get("comparison")
+    if baseline and comparison:
+        selected_run = st.selectbox(
+            "Resultaten tonen", ["baseline", "comparison"], index=1,
+            format_func=lambda run: (
+                f"Basisscenario: {baseline['name']}"
+                if run == "baseline" else f"Vergelijkingsscenario: {comparison['name']}"
+            ),
+            key="selected_scenario_view",
+        )
+        results = baseline["results"] if selected_run == "baseline" else comparison["results"]
     detail_discharges = results.get("detail_discharges", results["discharges"])
     detail_ids = sorted(
         int(catchment_id)
@@ -421,6 +454,7 @@ def render_result_navigation(results: dict):
 
     if selected_catchment is None:
         render_results_overview(results)
+        render_scenario_comparison()
         if detail_ids:
             st.selectbox(
                 "Selecteer een subcatchment",
@@ -445,6 +479,33 @@ def render_result_navigation(results: dict):
         selected_catchment, results["timestep_minutes"],
     )
     st.altair_chart(hydrograph, width="stretch")
+    if baseline and comparison:
+        baseline_discharges = baseline["results"].get("detail_discharges", baseline["results"]["discharges"])
+        comparison_discharges = comparison["results"].get("detail_discharges", comparison["results"]["discharges"])
+        column = f"discharge_catchment_{selected_catchment}_m3s"
+        if column in baseline_discharges and column in comparison_discharges:
+            paired = pd.concat([
+                baseline_discharges[["datetime", column]].assign(scenario=baseline["name"]),
+                comparison_discharges[["datetime", column]].assign(scenario=comparison["name"]),
+            ])
+            st.markdown("#### Gekoppelde hydrogrammen")
+            st.altair_chart(
+                alt.Chart(paired).mark_line().encode(
+                    x=alt.X("datetime:T", title="Datum en tijd"),
+                    y=alt.Y(f"{column}:Q", title="Afvoer [m³/s]"),
+                    color=alt.Color("scenario:N", title="Scenario"),
+                ), width="stretch",
+            )
+        baseline_summary = baseline["results"]["summary"].set_index("catchment_id")
+        comparison_summary = comparison["results"]["summary"].set_index("catchment_id")
+        if selected_catchment in baseline_summary.index and selected_catchment in comparison_summary.index:
+            class_areas = pd.DataFrame({
+                "Waterdiepteklasse": FLOODED_AREA_COLUMNS,
+                baseline["name"]: [baseline_summary.at[selected_catchment, field] for field in FLOODED_AREA_COLUMNS],
+                comparison["name"]: [comparison_summary.at[selected_catchment, field] for field in FLOODED_AREA_COLUMNS],
+            })
+            st.markdown("#### Overstroomd areaal vóór en na [ha]")
+            st.dataframe(class_areas, hide_index=True, width="stretch")
     st.markdown("#### Overstroomd areaal per waterdiepteklasse")
     render_event_summary_metrics(summary, results["rainfall_diagnostics"].total_depth_mm)
 
@@ -1342,6 +1403,19 @@ def read_maatregelen_from_uploads(files: List, label: str) -> Optional[gpd.GeoDa
 
 if run_button:
     try:
+        current_inputs = {
+            "geodata": geodata_file,
+            "catchments": catchments_file,
+            "inlets": inlets_file,
+            "rainfall": (
+                rainfall_csv_file if rainfall_source == "CSV upload"
+                else f"{rainfall_source}:{ts_id}:{start_date}:{end_date}"
+            ),
+            "rainfall_value_kind": rainfall_value_kind,
+            "timestep_minutes": int(timestep_minutes),
+            "a_threshold_m2": float(A_threshold),
+            "measures": maatregelen_files,
+        }
         setup_error = save_scenario_setup(
             st.session_state,
             ScenarioSetup(
@@ -1349,17 +1423,25 @@ if run_button:
                 rainfall_source=rainfall_source,
                 timestep_minutes=int(timestep_minutes),
                 a_threshold_m2=float(A_threshold),
-                uploaded_inputs={
-                    "geodata": geodata_file,
-                    "catchments": catchments_file,
-                    "inlets": inlets_file,
-                    "rainfall": rainfall_csv_file,
-                    "measures": maatregelen_files,
-                },
+                uploaded_inputs=current_inputs,
             ),
         )
         if setup_error:
             st.error(setup_error)
+        elif run_kind == "Basisscenario" and maatregelen_files:
+            st.error("Een basisscenario gebruikt geen geselecteerde maatregelen.")
+        elif run_kind == "Vergelijkingsscenario" and not maatregelen_files:
+            st.error("Selecteer minstens één maatregel voor het vergelijkingsscenario.")
+        elif run_kind == "Vergelijkingsscenario" and "baseline" not in st.session_state:
+            st.error("Voer eerst een basisscenario uit.")
+        elif run_kind == "Vergelijkingsscenario" and input_differences(
+            st.session_state["baseline"], {"inputs": snapshot_inputs(current_inputs)}
+        ):
+            st.error(
+                "Vergelijking niet mogelijk: niet-equivalente invoer: " + ", ".join(
+                    input_differences(st.session_state["baseline"], {"inputs": snapshot_inputs(current_inputs)})
+                )
+            )
         elif geodata_file is None or catchments_file is None or inlets_file is None:
             st.error("Upload eerst geodata, catchments en `inlets_pts.gpkg`.")
         elif rainfall_source == "CSV upload" and rainfall_csv_file is None:
@@ -1529,6 +1611,18 @@ if run_button:
                 "raster_transforms": {cid: inputs[cid]["transform"] for cid in catchment_ids_sorted},
             }
             st.session_state["selected_result_catchment"] = None
+            retained_run = {
+                "name": scenario_name.strip(),
+                "inputs": snapshot_inputs(current_inputs),
+                "results": st.session_state["simulation_results"],
+            }
+            if run_kind == "Basisscenario":
+                save_baseline(st.session_state, retained_run)
+                st.session_state.pop("comparison", None)
+                log("Basisscenario bewaard voor een vergelijking in deze browsersessie.")
+            else:
+                save_comparison(st.session_state, retained_run)
+                log("Vergelijkingsscenario bewaard voor deze browsersessie.")
 
             with plot_container.container():
                 render_result_navigation(st.session_state["simulation_results"])

@@ -1,7 +1,17 @@
 import unittest
 from pathlib import Path
 
-from scenario import ScenarioSetup, save_scenario_setup, saved_scenario_setup
+import pandas as pd
+
+from scenario import (
+    ScenarioSetup,
+    build_scenario_comparison,
+    input_differences,
+    save_baseline,
+    save_comparison,
+    save_scenario_setup,
+    saved_scenario_setup,
+)
 from streamlit.testing.v1 import AppTest
 
 
@@ -77,6 +87,84 @@ class ScenarioSetupTests(unittest.TestCase):
         self.assertIn(
             "Opgeslagen sessiescenario: 'Voorjaarsbui'",
             " ".join(caption.value for caption in app.caption),
+        )
+
+
+class ScenarioComparisonTests(unittest.TestCase):
+    def setUp(self):
+        self.baseline = {
+            "name": "Referentie",
+            "inputs": {"geodata": "a", "catchments": "b", "rainfall": "c"},
+            "results": self._results([1.0, 2.0], [0.2, 0.4]),
+        }
+        self.comparison = {
+            "name": "Bufferbekken",
+            "inputs": {"geodata": "a", "catchments": "b", "rainfall": "c"},
+            "results": self._results([1.5, 3.0], [0.3, 0.6]),
+        }
+
+    @staticmethod
+    def _results(discharge, areas):
+        times = pd.date_range("2025-01-01", periods=2, freq="h")
+        return {
+            "discharges": pd.DataFrame({
+                "datetime": times,
+                "discharge_catchment_2_m3s": discharge,
+            }),
+            "detail_discharges": pd.DataFrame({
+                "datetime": times,
+                "discharge_catchment_1_m3s": discharge,
+            }),
+            "summary": pd.DataFrame({
+                "catchment_id": [1, 2, "whole_catchment"],
+                "summary_scope": ["subcatchment", "subcatchment", "sum_of_subcatchments"],
+                "peak_discharge_m3s": [max(discharge), max(discharge), None],
+                "flooded_area_0_01_to_0_25m_ha": [areas[0], areas[1], sum(areas)],
+                "flooded_area_0_25_to_0_50m_ha": [0.0, 0.0, 0.0],
+                "flooded_area_0_50_to_1m_ha": [0.0, 0.0, 0.0],
+                "flooded_area_1_to_2m_ha": [0.0, 0.0, 0.0],
+                "flooded_area_over_2m_ha": [0.0, 0.0, 0.0],
+            }),
+        }
+
+    def test_retains_one_baseline_and_one_named_comparison_in_the_session(self):
+        state = {}
+
+        save_baseline(state, self.baseline)
+        save_comparison(state, self.comparison)
+
+        self.assertEqual(state["baseline"]["name"], "Referentie")
+        self.assertEqual(state["comparison"]["name"], "Bufferbekken")
+
+    def test_reports_inputs_that_differ_other_than_selected_measures(self):
+        changed = {**self.comparison, "inputs": {**self.comparison["inputs"], "rainfall": "other"}}
+
+        self.assertEqual(input_differences(self.baseline, changed), ["rainfall"])
+
+    def test_reports_a_changed_rainfall_interpretation(self):
+        baseline = {**self.baseline, "inputs": {**self.baseline["inputs"], "rainfall_value_kind": "depth"}}
+        comparison = {**self.comparison, "inputs": {**self.comparison["inputs"], "rainfall_value_kind": "intensity"}}
+
+        self.assertEqual(input_differences(baseline, comparison), ["rainfall_value_kind"])
+
+    def test_calculates_absolute_and_non_zero_baseline_percentage_changes(self):
+        overview = build_scenario_comparison(self.baseline, self.comparison)
+
+        terminal = overview["terminal_peaks"].iloc[0]
+        self.assertEqual(terminal["change_m3s"], 1.0)
+        self.assertEqual(terminal["change_percent"], 50.0)
+        self.assertAlmostEqual(
+            overview["subcatchments"].loc[1, "flooded_area_0_01_to_0_25m_ha_change"], 0.1
+        )
+
+    def test_omits_percentage_when_the_baseline_value_is_zero(self):
+        self.baseline["results"]["summary"].loc[0, "flooded_area_0_25_to_0_50m_ha"] = 0.0
+        self.comparison["results"]["summary"].loc[0, "flooded_area_0_25_to_0_50m_ha"] = 1.0
+
+        overview = build_scenario_comparison(self.baseline, self.comparison)
+
+        self.assertIsNone(
+            overview["subcatchments"].loc[1, "flooded_area_0_25_to_0_50m_ha_change_percent"]
         )
 
 

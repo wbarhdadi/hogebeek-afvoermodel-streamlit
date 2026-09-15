@@ -57,6 +57,41 @@ class ResultsViewTests(unittest.TestCase):
         self.assertIsNone(app.session_state["selected_result_catchment"])
         self.assertTrue(any("Gerangschikte subcatchments" in value for value in [markdown.value for markdown in app.markdown]))
 
+    def test_retained_runs_are_selectable_and_show_paired_detail_results(self):
+        times = pd.date_range("2025-01-01", periods=2, freq="h")
+        def results(discharge, area):
+            return {
+                "discharges": pd.DataFrame({"datetime": times, "discharge_catchment_1_m3s": discharge}),
+                "detail_discharges": pd.DataFrame({"datetime": times, "discharge_catchment_1_m3s": discharge}),
+                "waterlevels": pd.DataFrame({"datetime": times}),
+                "summary": pd.DataFrame({
+                    "catchment_id": [1], "summary_scope": ["subcatchment"],
+                    "peak_discharge_m3s": [max(discharge)],
+                    "flooded_area_0_01_to_0_25m_ha": [area],
+                    "flooded_area_0_25_to_0_50m_ha": [0.0], "flooded_area_0_50_to_1m_ha": [0.0],
+                    "flooded_area_1_to_2m_ha": [0.0], "flooded_area_over_2m_ha": [0.0],
+                }),
+                "rainfall": pd.DataFrame({"datetime": times, "rainfall_depth_mm": [1.0, 0.0]}),
+                "rainfall_diagnostics": type("Diagnostics", (), {"total_depth_mm": 1.0})(),
+                "timestep_minutes": 60,
+            }
+
+        baseline, comparison = results([0.0, 1.0], 0.1), results([0.0, 2.0], 0.2)
+        app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+        app.session_state["simulation_results"] = comparison
+        app.session_state["baseline"] = {"name": "Referentie", "inputs": {"rainfall": "same"}, "results": baseline}
+        app.session_state["comparison"] = {"name": "Referentie", "inputs": {"rainfall": "same"}, "results": comparison}
+
+        app.run()
+
+        self.assertIn("Resultaten tonen", [selectbox.label for selectbox in app.selectbox])
+        app.session_state["selected_scenario_view"] = "baseline"
+        app.run()
+        self.assertEqual(app.session_state["selected_scenario_view"], "baseline")
+        next(selectbox for selectbox in app.selectbox if selectbox.label == "Selecteer een subcatchment").select("1").run()
+        self.assertTrue(any("Gekoppelde hydrogrammen" in value for value in [markdown.value for markdown in app.markdown]))
+        self.assertTrue(any("vóór en na" in value for value in [markdown.value for markdown in app.markdown]))
+
 
 if __name__ == "__main__":
     unittest.main()
