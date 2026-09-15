@@ -17,6 +17,7 @@ from rainfall import (
     waterinfo_value_kind as detect_waterinfo_value_kind,
 )
 from reporting import build_output_tables
+from visualization import build_detail_charts
 from hydrology import (
     DIRECTION_MAP, accumulate_travel_time, compute_effective_recharge,
     route_Q_channel, tv_convolve_next,
@@ -1311,12 +1312,21 @@ if run_button:
             df_rf = rf_timeseries.rename(
                 columns={"datum": "datetime", "rf": "rainfall_depth_mm"}
             )
+            st.session_state["simulation_results"] = {
+                "catchment_ids": catchment_ids_sorted,
+                "discharges": df_Q,
+                "waterlevels": df_H,
+                "summary": df_summary,
+                "rainfall": df_rf,
+                "rainfall_diagnostics": rf_diagnostics,
+                "timestep_minutes": int(timestep_minutes),
+            }
 
             with plot_container:
                 st.markdown("#### Simulatieresultaten")
                 if catchment_ids_sorted:
                     selected_cid = st.selectbox(
-                        "Stroomgebied", catchment_ids_sorted, key="result_catchment"
+                        "Stroomgebied", catchment_ids_sorted, key="initial_result_catchment"
                     )
                     summary = df_summary.set_index("catchment_id").loc[selected_cid]
                     metric_a, metric_b, metric_c = st.columns(3)
@@ -1346,8 +1356,10 @@ if run_button:
                         y=alt.Y(f"{level_column}:Q", title="Waterpeil [m TAW]"),
                         tooltip=["datetime:T", alt.Tooltip(f"{level_column}:Q", format=".3f")],
                     ).properties(title=f"Waterpeil — stroomgebied {selected_cid}")
-                    st.altair_chart(rainfall_chart, use_container_width=True)
-                    st.altair_chart(discharge_chart, use_container_width=True)
+                    hydrograph, waterlevel_chart = build_detail_charts(
+                        df_rf, df_Q, df_H, selected_cid, int(timestep_minutes)
+                    )
+                    st.altair_chart(hydrograph, use_container_width=True)
                     st.altair_chart(waterlevel_chart, use_container_width=True)
                     st.markdown("#### Samenvatting per stroomgebied")
                     st.dataframe(df_summary, hide_index=True, use_container_width=True)
@@ -1442,3 +1454,26 @@ if run_button:
         log("Fout tijdens de run – zie traceback hierboven.")
         progress_bar.progress(0)
         timestep_text.empty()
+
+
+if "simulation_results" in st.session_state and not run_button:
+    results = st.session_state["simulation_results"]
+    with plot_container:
+        st.markdown("#### Simulatieresultaten")
+        if results["catchment_ids"]:
+            selected_cid = st.selectbox(
+                "Stroomgebied", results["catchment_ids"], key="result_catchment"
+            )
+            summary = results["summary"].set_index("catchment_id").loc[selected_cid]
+            metric_a, metric_b, metric_c = st.columns(3)
+            metric_a.metric("Totale neerslag", f"{results['rainfall_diagnostics'].total_depth_mm:.1f} mm")
+            metric_b.metric("Piekafvoer", f"{summary['peak_discharge_m3s']:.3g} m3/s")
+            metric_c.metric("Maximaal waterpeil", f"{summary['max_water_level_m_taw']:.2f} m TAW")
+            hydrograph, waterlevel_chart = build_detail_charts(
+                results["rainfall"], results["discharges"], results["waterlevels"],
+                selected_cid, results["timestep_minutes"],
+            )
+            st.altair_chart(hydrograph, use_container_width=True)
+            st.altair_chart(waterlevel_chart, use_container_width=True)
+        else:
+            st.info("Geen stroomgebieden gevonden in de inputs.")
