@@ -71,8 +71,8 @@ def hydrograph():
     started = datetime(2025, 10, 3, 8)
     values = []
     for hour in range(18):
-        peak = max(0, 1 - abs(hour - item.vertraging / 15) / 4)
-        values.append({"tijd": started + timedelta(hours=hour), "Afvoer": round(item.piek * peak, 3), "Neerslag": max(0, 9 - abs(hour - 3) * 2)})
+        peak = max(0, 1 - abs(hour - item["vertraging"] / 15) / 4)
+        values.append({"tijd": started + timedelta(hours=hour), "Afvoer": round(item["piek"] * peak, 3), "Neerslag": max(0, 9 - abs(hour - 3) * 2)})
     data = pd.DataFrame(values)
     discharge = alt.Chart(data).mark_line(color="#1e5f87", strokeWidth=3).encode(
         x=alt.X("tijd:T", title=None), y=alt.Y("Afvoer:Q", title="Afvoer [m³/s]"), tooltip=["tijd:T", "Afvoer:Q"]
@@ -99,11 +99,13 @@ def compact_diagnostics():
 
 def result_detail():
     item = selected()
-    st.subheader(f"{item.naam} · {item.id}")
+    # ``selected`` is a Series indexed by catchment id; access the identifier
+    # through its index name, not Series attribute lookup.
+    st.subheader(f"{item['naam']} · {item.name}")
     a, b, c = st.columns(3)
-    a.metric("Max. waterdiepte", f"{item.diepte:.2f} m", "−0,08 m t.o.v. basis")
-    b.metric("Piekafvoer", f"{item.piek:.2f} m³/s", "−12%")
-    c.metric("Piekvertraging", f"{item.vertraging} min", "+10 min")
+    a.metric("Max. waterdiepte", f"{item['diepte']:.2f} m", "−0,08 m t.o.v. basis")
+    b.metric("Piekafvoer", f"{item['piek']:.2f} m³/s", "−12%")
+    c.metric("Piekvertraging", f"{item['vertraging']} min", "+10 min")
     hydrograph()
 
 
