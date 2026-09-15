@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -63,6 +64,25 @@ class PreparedPlanEngineTests(unittest.TestCase):
 
         self.assertGreater(result.outflow_volume_m3[1][1], 0.0)
         self.assertEqual(result.outflow_volume_m3[1][0], 0.0)
+
+    def test_extreme_finite_lag_is_sparse_and_retained_in_balance_diagnostics(self):
+        plan = prepare([q_catchment(1)], cell_width_m=10.0, timestep_seconds=1.0, channel_threshold=1.0)
+        # This is a valid finite travel time, deliberately too large for a
+        # dense lag-indexed queue to be a viable representation.
+        with patch("hydrology._travel_times", return_value=np.array([[1_000_000_000_000.0, 0.0]])):
+            result = run(plan, [1.0], max_drain_steps=0)
+
+        queue = result.state.travel_time_queues_m3[1]
+        self.assertIsInstance(queue, dict)
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(result.earliest_travel_queue_due_timestep[1], 1_000_000_000_000)
+        self.assertEqual(result.maximum_travel_queue_lag[1], 999_999_999_999)
+        self.assertGreater(result.final_travel_queue_m3[1], 0.0)
+        self.assertAlmostEqual(
+            result.generated_effective_volume_m3,
+            result.terminal_outflow_volume_m3 + result.final_retained_volume_m3,
+        )
+        self.assertLessEqual(abs(result.whole_system_balance_residual_m3), 1e-9)
 
     def test_same_timestep_topological_coupling_is_independent_of_input_order(self):
         upstream = q_catchment(1)

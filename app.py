@@ -10,6 +10,7 @@ import pandas as pd
 import rasterio
 import streamlit as st
 import altair as alt
+import pydeck as pdk
 from rasterio.transform import from_origin
 
 from rainfall import (
@@ -18,10 +19,8 @@ from rainfall import (
 )
 from reporting import FLOODED_AREA_COLUMNS, build_output_tables, build_results_zip
 from visualization import build_detail_charts, build_waterdepth_map
-from hydrology import (
-    DIRECTION_MAP, accumulate_travel_time, compute_effective_recharge,
-    route_Q_channel, tv_convolve_next,
-)
+from hydrology import DIRECTION_MAP, HOutlet, QOutlet, SubcatchmentInput
+from workflow import PreparationCache, ScenarioRequest, run_scenario
 from scenario import (
     ScenarioSetup, build_scenario_comparison, input_differences, save_baseline,
     save_comparison, save_scenario_setup, saved_scenario_setup, snapshot_inputs,
@@ -134,7 +133,7 @@ if "logs" not in st.session_state:
 # STREAMLIT UI – LAYOUT
 # ============================================================
 
-with st.sidebar:
+with st.expander("Scenariolade", expanded=not bool(st.session_state.get("simulation_results"))):
     st.header("Scenario instellen")
     run_kind = st.radio(
         "Uitvoering", ["Basisscenario", "Vergelijkingsscenario"],
@@ -361,7 +360,7 @@ def render_event_summary_metrics(summary: pd.Series, total_rainfall_mm: float):
 
 
 def render_results_overview(results: dict):
-    """Render the map-free, catchment-wide scenario result overview."""
+    """Render the map-first, catchment-wide scenario result overview."""
     summary = results["summary"]
     subcatchments = summary.loc[summary.get("summary_scope", "subcatchment") == "subcatchment"].copy()
     total_rows = summary.loc[summary.get("summary_scope", "") == "sum_of_subcatchments"]
@@ -372,6 +371,20 @@ def render_results_overview(results: dict):
 
     st.markdown("#### Simulatieresultaten")
     st.caption("Snelle modelschattingen voor scenarioverkenning; geen lokale voorspellingen.")
+    features = results.get("catchment_features", [])
+    if features:
+        st.pydeck_chart(pdk.Deck(
+            initial_view_state=pdk.ViewState(latitude=features[0]["properties"]["latitude"], longitude=features[0]["properties"]["longitude"], zoom=12),
+            layers=[pdk.Layer(
+                "GeoJsonLayer", features, pickable=True, stroked=True, filled=True,
+                get_fill_color="[40, 120, 181, 110]", get_line_color="[8, 48, 107, 220]",
+                line_width_min_pixels=1,
+            )],
+            tooltip={"html": "<b>Subcatchment {catchment_id}</b><br/>Max. waterdiepte: {max_water_depth_m} m<br/>Piekafvoer: {peak_discharge_m3s} m³/s<br/>Overstroomd areaal: {flooded_area_ha} ha"},
+        ), width="stretch")
+        st.caption("Hover over een polygoon voor de samenvatting; kies hieronder een subcatchment voor het gekoppelde hydrogram.")
+    elif results.get("spatial_message"):
+        st.warning(results["spatial_message"])
     total_metrics = total_rows.iloc[0] if not total_rows.empty else subcatchments[list(FLOODED_AREA_COLUMNS)].sum()
     metric_columns = st.columns(3)
     metric_columns[0].metric(
@@ -1164,6 +1177,66 @@ def build_reservoirs(
     return reservoirs
 
 
+def build_workflow_sources(catchments: gpd.GeoDataFrame, inputs: Dict[int, dict], cell_width_m: float, reservoirs=None):
+    """Adapt prepared spatial inputs to the UI-independent workflow contract."""
+    sources = []
+    for _, catchment in catchments.iterrows():
+        cid = int(catchment.uitstroompunt_nummer)
+        if cid not in inputs:
+            continue
+        data = inputs[cid]
+        terrain = data["dtm_catchment"]
+        finite = terrain[np.isfinite(terrain)]
+        if not finite.size:
+            raise ValueError(f"Subcatchment {cid} heeft geen geldig terreinraster.")
+        legacy_reservoir = (reservoirs or {}).get(cid)
+        outlet_level = float(getattr(catchment, "outlet_mtaw", finite.max()))
+        lower = min(float(finite.min()), outlet_level)
+        upper = max(float(finite.max()), outlet_level)
+        levels = np.linspace(lower, upper, 100)
+        _, volumes = waterlevel_volume_curve(terrain, cell_width_m**2, levels)
+        if str(getattr(catchment, "uitstroompunt_type", "Q")) == "Q":
+            outlet_rule = QOutlet(
+                recession_coefficient_s_inv=(1.0 / float(catchment.K_s)
+                                            if hasattr(catchment, "K_s") else float(legacy_reservoir.A)),
+                max_discharge_m3s=(float(catchment.Q_cap_ms)
+                                    if hasattr(catchment, "Q_cap_ms") else float(legacy_reservoir.Qmax)),
+                levels_m_taw=levels,
+                volumes_m3=volumes,
+            )
+        else:
+            outlet_rule = HOutlet(outlet_level, levels, volumes)
+        sources.append(SubcatchmentInput(
+            catchment_id=cid,
+            runoff_percent=data["ro_catchment"], slope=data["S_catchment"],
+            manning_n=data["manning_catchment"], flow_direction=data["fd_catchment"],
+            accumulated_area=data["fa_catchment"], outlet=data["outlet_indices"],
+            inlets=data["inlet_dict"], outlet_rule=outlet_rule,
+        ))
+    return tuple(sources)
+
+
+def build_catchment_features(catchments: gpd.GeoDataFrame, summary: pd.DataFrame) -> list[dict]:
+    """Create bounded polygon display records; invalid geometry is omitted visibly."""
+    if catchments.crs is None:
+        return []
+    rows = summary.loc[summary["summary_scope"] == "subcatchment"].set_index("catchment_id")
+    features = []
+    for _, row in catchments.to_crs(4326).iterrows():
+        cid = int(row.uitstroompunt_nummer)
+        if cid not in rows.index or row.geometry is None or row.geometry.is_empty or not row.geometry.is_valid:
+            continue
+        values = rows.loc[cid]
+        point = row.geometry.representative_point()
+        features.append({"type": "Feature", "geometry": row.geometry.__geo_interface__, "properties": {
+            "catchment_id": cid, "latitude": point.y, "longitude": point.x,
+            "max_water_depth_m": round(float(values.get("max_water_depth_m", 0.0)), 3),
+            "peak_discharge_m3s": round(float(values["peak_discharge_m3s"]), 5),
+            "flooded_area_ha": round(float(values[list(FLOODED_AREA_COLUMNS)].sum()), 3),
+        }})
+    return features
+
+
 def run_model(
     catchments: gpd.GeoDataFrame,
     inputs: Dict[int, dict],
@@ -1173,188 +1246,35 @@ def run_model(
     A_threshold: float,
     update_progress=None,
 ):
-    """
-    Draai het model voor de opgegeven neerslagreeks.
-    Geen extra padding; max. 3 dagen is eerder al afgedwongen.
-    """
-    rf_df = rf_timeseries.copy()
-    rf_df["datum"] = pd.to_datetime(rf_df["datum"])
-    rf_df = rf_df.sort_values("datum")
+    """Run the prepared engine through the historic upload-controller signature."""
+    rainfall = rf_timeseries.rename(columns={"datum": "datetime", "rf": DEPTH_COLUMN})
+    sources = build_workflow_sources(catchments, inputs, L, reservoirs)
 
-    times = rf_df["datum"].to_numpy()
-    P_event = rf_df["rf"].to_numpy(dtype=float)
+    def progress(event):
+        if update_progress is None:
+            return
+        if event.kind == "simulating_interval" and event.completed is not None:
+            timestamp = rainfall["datetime"].iloc[min(event.completed - 1, len(rainfall) - 1)]
+            update_progress(event.completed, event.total or len(rainfall), timestamp)
 
-    if len(times) >= 2:
-        dt = pd.to_timedelta(
-            np.median(np.diff(times.astype("datetime64[ns]")))
-        )
-    else:
-        dt = pd.to_timedelta("3600s")
-
-    T = float(dt.total_seconds())
-    n_steps = len(P_event)
-
-    catchment_ids = [int(c) for c in catchments.uitstroompunt_nummer.values]
-    catchment_outflow_volumes: Dict[int, np.ndarray] = {
-        cid: np.zeros(n_steps, dtype=float) for cid in catchment_ids
-    }
-    catchment_waterlevels: Dict[int, np.ndarray] = {}
-
-    for cid in catchment_ids:
-        base_level = reservoirs[cid].get_waterlevel_from_volume(0.0)
-        catchment_waterlevels[cid] = np.ones(n_steps, dtype=float) * base_level
-
-    PUs: Dict[int, np.ndarray] = {}
-
-    log("Stap: modelrun gestart.")
-
-    for timestep in range(1, n_steps):
-        if update_progress is not None:
-            update_progress(timestep, n_steps, times[timestep])
-
-        P_current = float(P_event[timestep])
-
-        for _, catchment in catchments.iterrows():
-            cid = int(catchment.uitstroompunt_nummer)
-            if cid not in inputs:
-                continue
-
-            inp = inputs[cid]
-            ro_catchment = inp["ro_catchment"]
-            inlet_dict = inp["inlet_dict"]
-            inlet_ids = list(inlet_dict.keys())
-
-            if inlet_ids:
-                discharge_in_array = np.array(
-                    [catchment_outflow_volumes[inlet_id][timestep - 1] for inlet_id in inlet_ids]
-                )
-                discharge_in_dict = {
-                    inlet_id: incoming
-                    for inlet_id, incoming in zip(inlet_ids, discharge_in_array)
-                }
-            else:
-                discharge_in_dict = {}
-
-            S_catchment = inp["S_catchment"]
-            fd_catchment = inp["fd_catchment"].astype(float)
-            fa_catchment = inp["fa_catchment"]
-            n_catchment = inp["manning_catchment"]
-            dtm_catchment = inp["dtm_catchment"]
-            outlet_indices = inp["outlet_indices"]
-
-            channel_mask = fa_catchment >= float(A_threshold)
-
-            for inlet_indices in inlet_dict.values():
-                if not channel_mask[inlet_indices]:
-                    raise Exception("A_threshold te hoog, inlaat niet verbonden met kanaalcel(len).")
-
-            effective_rainfall = compute_effective_recharge(P_current, ro_catchment)
-
-            fd_c = fd_catchment.astype(float)
-            fd_c[fd_c == -9999] = np.nan
-
-            Qs = route_Q_channel(
-                fd_c,
-                dtm_catchment,
-                channel_mask,
-                discharge_in_dict,
-                inlet_dict,
-                effective_rainfall,
-                outlet_indices,
-                L,
-            )
-
-            effective_Q = np.zeros_like(fd_c, dtype=float)
-            for inlet_id, rc in inlet_dict.items():
-                effective_Q[tuple(rc)] = discharge_in_dict.get(inlet_id, 0.0)
-
-            catchment_mask = ~np.isnan(fd_c)
-            travel_time = np.ones_like(fd_c, dtype=float) * np.inf
-            if P_current != 0.0:
-                travel_time[catchment_mask] = (
-                    L**0.6 * n_catchment[catchment_mask] ** 0.6
-                ) / (
-                    effective_rainfall[catchment_mask] ** 0.4
-                    * S_catchment[catchment_mask] ** 0.3
-                )
-
-            Qs_flow = Qs / T
-            B = L / 2.0
-            if not np.all(Qs_flow[channel_mask] == 0.0):
-                channel_mask2 = Qs_flow != 0.0
-                travel_time[channel_mask2] = L / (
-                    (S_catchment[channel_mask2] ** 0.5 / n_catchment[channel_mask2])
-                    * (Qs_flow[channel_mask2] / B) ** (2.0 / 3.0)
-                ) ** (3.0 / 5.0)
-
-            accumulated_travel_time = accumulate_travel_time(
-                travel_time, fd_c, tuple(outlet_indices)
-            )
-
-            valid = accumulated_travel_time != np.inf
-            if not np.any(valid):
-                continue
-
-            pixel_area = L**2
-            t_max = float(np.nanmax(accumulated_travel_time[valid]))
-            # Beperk lengte van de unit-respons om geheugen te sparen
-            bins_full = np.arange(0.0, t_max + T, T)
-            max_lags = 200  # eventueel lager/hoger zetten
-            if len(bins_full) - 1 > max_lags:
-                lags = max_lags
-                bins = np.linspace(0.0, t_max, lags + 1)
-            else:
-                bins = bins_full
-                lags = len(bins) - 1
-
-            PU_current = np.zeros((lags, 1), dtype=float)
-            mm_to_m = 1e-3
-
-            for lag in range(lags):
-                t_start, t_end = bins[lag], bins[lag + 1]
-                mask = (accumulated_travel_time >= t_start) & (
-                    accumulated_travel_time < t_end
-                )
-                if not np.any(mask):
-                    continue
-
-                iso_vol = effective_Q[mask].sum() + (
-                    effective_rainfall[mask] * mm_to_m * pixel_area
-                ).sum()
-                PU_current[lag, 0] = iso_vol
-
-
-            if timestep == 1 or cid not in PUs:
-                PUs[cid] = PU_current
-                PU_total = PU_current
-            else:
-                PU_prev = PUs[cid]
-                if len(PU_current) < len(PU_prev):
-                    PU_current = np.pad(
-                        PU_current,
-                        [(0, len(PU_prev) - len(PU_current)), (0, 0)],
-                    )
-                elif len(PU_current) > len(PU_prev):
-                    PU_prev = np.pad(
-                        PU_prev,
-                        [(0, len(PU_current) - len(PU_prev)), (0, 0)],
-                    )
-                PU_total = np.concatenate((PU_prev, PU_current), axis=1)
-                PUs[cid] = PU_total
-
-            PU_total_padded = np.pad(
-                PU_total, [(0, max(0, timestep - lags)), (0, 0)]
-            )
-            catchment_current_Q = tv_convolve_next(PU_total_padded, timestep)
-
-            Vout = reservoirs[cid].transfer(catchment_current_Q, T)
-            catchment_outflow_volumes[cid][timestep] = Vout
-            catchment_waterlevels[cid][timestep] = reservoirs[cid].get_waterlevel_from_volume(
-                reservoirs[cid].S
-            )
-
-    log("Stap: modelrun afgerond.")
-    return catchment_outflow_volumes, catchment_waterlevels, times, T
+    outcome = run_scenario(ScenarioRequest(
+        name="interactive scenario", rainfall=rainfall, rainfall_value_kind="depth",
+        subcatchments=sources, cell_width_m=L, channel_threshold_m2=A_threshold,
+        timestep_minutes=int(pd.Timedelta(rf_timeseries["datum"].iloc[1] - rf_timeseries["datum"].iloc[0]).total_seconds() / 60)
+        if len(rf_timeseries) > 1 else 60,
+        terrain_by_catchment={cid: item["dtm_catchment"] for cid, item in inputs.items()},
+    ), progress)
+    if not outcome.succeeded:
+        raise ValueError("; ".join(item.message for item in outcome.diagnostics))
+    timestamps = pd.date_range(
+        outcome.rainfall["datetime"].iloc[0], periods=len(next(iter(outcome.engine_result.outflow_volume_m3.values()))),
+        freq=pd.Timedelta(seconds=outcome.prepared_plan.timestep_seconds),
+    ).to_numpy()
+    return (
+        dict(outcome.engine_result.outflow_volume_m3),
+        dict(outcome.engine_result.water_level_m_taw), timestamps,
+        outcome.prepared_plan.timestep_seconds,
+    )
 
 
 # ------------------------------------------------------------
@@ -1609,6 +1529,8 @@ if run_button:
                     for cid in catchment_ids_sorted
                 },
                 "raster_transforms": {cid: inputs[cid]["transform"] for cid in catchment_ids_sorted},
+                "catchment_features": build_catchment_features(catchments, df_summary),
+                "spatial_message": "De kaart is alleen beschikbaar voor geldige, geprojecteerde subcatchmentpolygonen.",
             }
             st.session_state["selected_result_catchment"] = None
             retained_run = {

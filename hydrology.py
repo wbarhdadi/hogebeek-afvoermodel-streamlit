@@ -7,7 +7,7 @@ the routing calculation can be exercised independently from the page.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Mapping, Tuple
+from typing import Callable, Dict, Iterable, Mapping, Tuple
 
 import numpy as np
 
@@ -194,7 +194,9 @@ class ModelState:
     """Per-run dynamic travel-time queues and outlet storage at interval start."""
 
     timestep: int
-    travel_time_queues_m3: Mapping[int, np.ndarray]
+    # Absolute due timestep -> volume.  Sparse storage is essential: a finite
+    # but extreme travel time must not make runtime memory proportional to lag.
+    travel_time_queues_m3: Mapping[int, Mapping[int, float]]
     outlet_storage_m3: Mapping[int, float]
 
 
@@ -217,6 +219,8 @@ class SimulationResult:
     terminal_outflow_volume_m3: float
     final_outlet_storage_m3: Mapping[int, float]
     final_travel_queue_m3: Mapping[int, float]
+    earliest_travel_queue_due_timestep: Mapping[int, int | None]
+    maximum_travel_queue_lag: Mapping[int, int]
     final_retained_volume_m3: float
     whole_system_balance_residual_m3: float
     per_subcatchment_balance_residual_m3: Mapping[int, float]
@@ -365,7 +369,7 @@ def prepare(
 
 
 def initial_state(plan: PreparedPlan) -> ModelState:
-    return ModelState(0, {cid: np.zeros(1) for cid in plan.catchments}, {cid: 0.0 for cid in plan.catchments})
+    return ModelState(0, {cid: {} for cid in plan.catchments}, {cid: 0.0 for cid in plan.catchments})
 
 
 def _travel_times(prepared: PreparedSubcatchment, rainfall_depth_mm: float, incoming: Mapping[int, float], timestep_seconds: float, cell_width_m: float) -> np.ndarray:
@@ -402,6 +406,68 @@ def _travel_times(prepared: PreparedSubcatchment, rainfall_depth_mm: float, inco
     return accumulated
 
 
+def _dry_inlet_travel_times(
+    prepared: PreparedSubcatchment,
+    incoming: Mapping[int, float],
+    timestep_seconds: float,
+    cell_width_m: float,
+) -> Mapping[Tuple[int, int], float]:
+    """Calculate dry-weather travel times only on active inlet-to-outlet paths."""
+    source = prepared.source
+    inlet_volumes: dict[Tuple[int, int], float] = {}
+    for upstream, volume in incoming.items():
+        if volume > 0.0:
+            inlet = tuple(source.inlets[upstream])
+            inlet_volumes[inlet] = inlet_volumes.get(inlet, 0.0) + float(volume)
+    active: set[Tuple[int, int]] = set()
+    for inlet in inlet_volumes:
+        cell: Tuple[int, int] | None = inlet
+        while cell is not None and cell not in active:
+            active.add(cell)
+            cell = prepared.downstream_cell[cell]
+
+    # This is the induced acyclic routing graph.  Its topological traversal
+    # preserves confluence volumes without scanning unrelated raster cells.
+    indegree = {cell: 0 for cell in active}
+    for cell in active:
+        successor = prepared.downstream_cell[cell]
+        if successor in indegree:
+            indegree[successor] += 1
+    ready = [cell for cell in active if indegree[cell] == 0]
+    order: list[Tuple[int, int]] = []
+    throughflow = {cell: inlet_volumes.get(cell, 0.0) for cell in active}
+    while ready:
+        cell = ready.pop()
+        order.append(cell)
+        successor = prepared.downstream_cell[cell]
+        if successor in indegree:
+            throughflow[successor] += throughflow[cell]
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                ready.append(successor)
+
+    travel: dict[Tuple[int, int], float] = {}
+    for cell in order:
+        if cell == source.outlet:
+            travel[cell] = 0.0
+        elif prepared.channel_mask[cell] and throughflow[cell] > 0.0:
+            q = throughflow[cell] / timestep_seconds
+            width = cell_width_m / 2.0
+            travel[cell] = cell_width_m / ((np.sqrt(source.slope[cell]) / source.manning_n[cell]) * (q / width) ** (2.0 / 3.0)) ** (3.0 / 5.0)
+        else:
+            travel[cell] = np.inf
+    accumulated: dict[Tuple[int, int], float] = {}
+    for cell in reversed(order):
+        successor = prepared.downstream_cell[cell]
+        if cell == source.outlet:
+            accumulated[cell] = 0.0
+        elif np.isfinite(travel[cell]) and successor in accumulated and np.isfinite(accumulated[successor]):
+            accumulated[cell] = travel[cell] + accumulated[successor]
+        else:
+            accumulated[cell] = np.inf
+    return {inlet: accumulated.get(inlet, np.inf) for inlet in inlet_volumes}
+
+
 def _outlet_transition(rule: OutletRule, storage: float, inflow: float, timestep_seconds: float) -> tuple[float, float, float | None]:
     available = storage + inflow
     if isinstance(rule, QOutlet):
@@ -427,7 +493,7 @@ def step(plan: PreparedPlan, state: ModelState, rainfall_depth_mm: float) -> Ste
     """Advance every subcatchment once in deterministic topological order."""
     if not np.isfinite(rainfall_depth_mm) or rainfall_depth_mm < 0:
         raise ValueError("rainfall depth must be finite and non-negative")
-    queues: dict[int, np.ndarray] = {}
+    queues: dict[int, Mapping[int, float]] = {}
     storages: dict[int, float] = {}
     outflows: dict[int, float] = {}
     levels: dict[int, float | None] = {}
@@ -438,27 +504,36 @@ def step(plan: PreparedPlan, state: ModelState, rainfall_depth_mm: float) -> Ste
         source = prepared.source
         incoming = {upstream: outflows[upstream] for upstream in source.inlets}
         received[cid] = float(sum(incoming.values()))
-        effective = rainfall_depth_mm * source.runoff_percent / 100.0
-        generated[cid] = float(np.sum(np.where(prepared.valid_mask, effective * 0.001 * plan.cell_width_m**2, 0.0)))
-        accumulated = _travel_times(prepared, rainfall_depth_mm, incoming, plan.timestep_seconds, plan.cell_width_m)
-        old = np.asarray(state.travel_time_queues_m3[cid], dtype=float)
-        next_queue = np.zeros(max(1, len(old)), dtype=float)
-        release = float(old[0])
-        if len(old) > 1:
-            next_queue[: len(old) - 1] = old[1:]
-        parcels: list[tuple[Tuple[int, int], float]] = []
-        for cell in zip(*np.where(prepared.valid_mask)):
-            volume = float(effective[cell] * 0.001 * plan.cell_width_m**2)
-            if volume > 0:
-                parcels.append(((int(cell[0]), int(cell[1])), volume))
-        parcels.extend((tuple(cell), volume) for upstream, cell in source.inlets.items() if (volume := incoming[upstream]) > 0)
+        old = state.travel_time_queues_m3[cid]
+        release = float(old.get(state.timestep, 0.0))
+        next_queue = {due: float(volume) for due, volume in old.items() if due > state.timestep and volume > 0.0}
+        # A dry catchment only routes non-zero upstream outflow.  Avoiding its
+        # unrelated cell-scale work makes long dry drains practical.
+        if rainfall_depth_mm == 0.0:
+            generated[cid] = 0.0
+            parcels = [(tuple(source.inlets[upstream]), volume) for upstream, volume in incoming.items() if volume > 0.0]
+            accumulated_by_cell = _dry_inlet_travel_times(prepared, incoming, plan.timestep_seconds, plan.cell_width_m) if parcels else {}
+        else:
+            effective = rainfall_depth_mm * source.runoff_percent / 100.0
+            generated[cid] = float(np.sum(np.where(prepared.valid_mask, effective * 0.001 * plan.cell_width_m**2, 0.0)))
+            accumulated = _travel_times(prepared, rainfall_depth_mm, incoming, plan.timestep_seconds, plan.cell_width_m)
+            parcels: list[tuple[Tuple[int, int], float]] = []
+            for cell in zip(*np.where(prepared.valid_mask)):
+                volume = float(effective[cell] * 0.001 * plan.cell_width_m**2)
+                if volume > 0:
+                    parcels.append(((int(cell[0]), int(cell[1])), volume))
+            parcels.extend((tuple(cell), volume) for upstream, cell in source.inlets.items() if (volume := incoming[upstream]) > 0)
+            accumulated_by_cell = {cell: float(accumulated[cell]) for cell, _ in parcels}
         for cell, volume in parcels:
-            lag = int(np.floor(accumulated[cell] / plan.timestep_seconds + 1e-12))
-            if lag >= len(next_queue):
-                next_queue = np.pad(next_queue, (0, lag + 1 - len(next_queue)))
-            next_queue[lag] += volume
-        release += float(next_queue[0])
-        next_queue[0] = 0.0
+            travel_time = accumulated_by_cell[cell]
+            if not np.isfinite(travel_time) or travel_time < 0.0:
+                raise ValueError(f"subcatchment {cid} has non-finite or negative travel time at {cell}")
+            lag = int(np.floor(travel_time / plan.timestep_seconds + 1e-12))
+            due = state.timestep + lag
+            if due == state.timestep:
+                release += volume
+            else:
+                next_queue[due] = next_queue.get(due, 0.0) + volume
         outflow, storage, level = _outlet_transition(source.outlet_rule, float(state.outlet_storage_m3[cid]), release, plan.timestep_seconds)
         queues[cid] = next_queue
         storages[cid] = storage
@@ -467,7 +542,13 @@ def step(plan: PreparedPlan, state: ModelState, rainfall_depth_mm: float) -> Ste
     return StepResult(ModelState(state.timestep + 1, queues, storages), outflows, levels, generated, received)
 
 
-def run(plan: PreparedPlan, rainfall_depths_mm: Iterable[float], *, max_drain_steps: int = 200) -> SimulationResult:
+def run(
+    plan: PreparedPlan,
+    rainfall_depths_mm: Iterable[float],
+    *,
+    max_drain_steps: int = 200,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> SimulationResult:
     """Run all supplied rainfall intervals, then dry-drain explicit model state."""
     if max_drain_steps < 0:
         raise ValueError("max_drain_steps cannot be negative")
@@ -477,7 +558,10 @@ def run(plan: PreparedPlan, rainfall_depths_mm: Iterable[float], *, max_drain_st
     generated_total = 0.0
     generated_by_catchment = {cid: 0.0 for cid in plan.catchments}
     received_by_catchment = {cid: 0.0 for cid in plan.catchments}
-    for depth in rainfall_depths_mm:
+    depths = tuple(float(depth) for depth in rainfall_depths_mm)
+    for timestep, depth in enumerate(depths, start=1):
+        if progress_callback is not None:
+            progress_callback("simulating_interval", timestep, len(depths))
         result = step(plan, state, float(depth))
         state = result.state
         generated_total += sum(result.generated_effective_volume_m3.values())
@@ -490,8 +574,10 @@ def run(plan: PreparedPlan, rainfall_depths_mm: Iterable[float], *, max_drain_st
     tolerance = max(1e-9, 1e-9 * generated_total)
     drain_steps = 0
     def retained() -> float:
-        return float(sum(state.outlet_storage_m3.values()) + sum(np.sum(queue) for queue in state.travel_time_queues_m3.values()))
+        return float(sum(state.outlet_storage_m3.values()) + sum(sum(queue.values()) for queue in state.travel_time_queues_m3.values()))
     while retained() > tolerance and drain_steps < max_drain_steps:
+        if progress_callback is not None:
+            progress_callback("draining", drain_steps + 1, max_drain_steps)
         result = step(plan, state, 0.0)
         state = result.state
         drain_steps += 1
@@ -499,7 +585,12 @@ def run(plan: PreparedPlan, rainfall_depths_mm: Iterable[float], *, max_drain_st
             received_by_catchment[cid] += result.received_upstream_volume_m3[cid]
             outflows[cid].append(result.outflow_volume_m3[cid])
             levels[cid].append(np.nan if result.water_level_m_taw[cid] is None else result.water_level_m_taw[cid])
-    final_queues = {cid: float(np.sum(queue)) for cid, queue in state.travel_time_queues_m3.items()}
+    final_queues = {cid: float(sum(queue.values())) for cid, queue in state.travel_time_queues_m3.items()}
+    earliest_due = {cid: min(queue, default=None) for cid, queue in state.travel_time_queues_m3.items()}
+    maximum_lag = {
+        cid: max((due - state.timestep for due in queue), default=0)
+        for cid, queue in state.travel_time_queues_m3.items()
+    }
     terminal_outflow = float(sum(np.sum(outflows[cid]) for cid in plan.terminal_outlet_ids))
     retained_volume = retained()
     per_catchment_residual = {
@@ -507,4 +598,4 @@ def run(plan: PreparedPlan, rainfall_depths_mm: Iterable[float], *, max_drain_st
         - state.outlet_storage_m3[cid] - final_queues[cid]
         for cid in plan.catchments
     }
-    return SimulationResult({cid: np.asarray(values) for cid, values in outflows.items()}, {cid: np.asarray(values) for cid, values in levels.items()}, generated_total, generated_by_catchment, received_by_catchment, terminal_outflow, dict(state.outlet_storage_m3), final_queues, retained_volume, generated_total - terminal_outflow - retained_volume, per_catchment_residual, drain_steps, retained_volume > tolerance, state)
+    return SimulationResult({cid: np.asarray(values) for cid, values in outflows.items()}, {cid: np.asarray(values) for cid, values in levels.items()}, generated_total, generated_by_catchment, received_by_catchment, terminal_outflow, dict(state.outlet_storage_m3), final_queues, earliest_due, maximum_lag, retained_volume, generated_total - terminal_outflow - retained_volume, per_catchment_residual, drain_steps, retained_volume > tolerance, state)

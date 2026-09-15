@@ -4,33 +4,62 @@ The accepted hydrological rules, timestep semantics, state transitions, and
 mass-conservation boundaries are defined in the
 [conceptual hydrological model](conceptual-hydrological-model.md).
 
-The Streamlit page is deliberately a thin orchestration layer. It reads files and user choices, invokes the model workflow, and renders results. The numerical routing implementation remains in `app.py` for now; moving it wholesale would make this quick improvement riskier than useful.
-
 ```text
-Waterinfo or CSV -> rainfall.prepare_rainfall -> mm per model timestep
-geodata + catchments + measures -> preprocess_geodata -> per-subcatchment rasters
-rainfall + rasters -> run_model -> hydrology routing helpers -> outflow volume [m3], water level [m TAW]
-outflow volume / timestep -> reporting.build_output_tables -> discharge [m3/s]
-tables -> charts, CSV exports, GeoTIFF maximum water depths
+raw rainfall + validated spatial source data
+  -> workflow.run_scenario(ScenarioRequest)
+  -> rainfall.prepare_rainfall + immutable PreparedPlan cache
+  -> hydrology.run(PreparedPlan, rainfall depths)
+  -> reporting.build_output_tables
+  -> ScenarioResult
+  -> Streamlit controller / exports / visualizations
 ```
 
-## Modules
+## Dependency direction
 
-- `app.py`: Streamlit UI, geospatial preprocessing, routing, reservoirs, and workflow orchestration.
-- `rainfall.py`: the rainfall-input seam. It validates input columns, regular timestamps, units, and compatible timestep aggregation.
-- `reporting.py`: the result-output seam. It converts model outflow volumes to discharge and gives exported fields explicit units.
-- `hydrology.py`: dependency-free numerical routing helpers used by the simulation. Their rainfall, D8 routing, and travel-time behaviour is covered without importing Streamlit.
+Domain modules do not import Streamlit. `app.py` is the outer controller: it
+collects uploads and choices, adapts them to a `ScenarioRequest`, invokes the
+workflow, and renders the returned records. It owns browser-session and
+presentation state only.
 
-## CSV rainfall contract
+- `rainfall.py` validates Waterinfo or upload values and converts them to
+  rainfall depth in mm per model timestep.
+- Spatial ingestion/preparation adapts source geometry and measures into
+  `SubcatchmentInput` records. `hydrology.prepare` validates those records and
+  produces the immutable `PreparedPlan` used by the numerical engine.
+- `hydrology.py` has no file, geometry-library, or UI dependency. It owns
+  runtime travel-time queues, outlet storage, routing, and mass balance.
+- `workflow.py` is the controller-facing domain facade. It validates,
+  normalizes rainfall, reuses deterministic prepared plans, executes the
+  engine, and assembles typed scenario results.
+- `reporting.py` converts outflow volumes to stakeholder-facing tables and
+  exports. `visualization.py` converts result data to presentation objects.
+- `scenario.py` owns browser-session scenario retention and comparison rules;
+  it does not own engine execution.
 
-Upload a CSV with a `datetime` column and exactly one selected value type:
+## Public workflow contract
 
-- Depth: `rainfall_mm`, the depth accumulated during each source interval.
-- Intensity: `rainfall_mmh`, the average intensity during each source interval.
+`run_scenario(request, progress_callback=None) -> ScenarioResult` is the
+non-UI seam for a full scenario run. `ScenarioRequest` carries the named
+scenario, raw rainfall input and its explicit unit kind, prepared-source
+subcatchments, timestep/configuration, and optional terrain data. A successful
+`ScenarioResult` contains normalized rainfall, rainfall diagnostics, an
+immutable prepared plan, engine result, output tables, and optional typed
+spatial maximum-depth results.
 
-Timestamps must be regular, unique and gap-free. Choose the matching value type in the app. The model timestep must be an integer multiple of the source interval; the app intentionally rejects ambiguous upsampling.
+Expected input, topology, and simulation configuration failures are returned
+as structured `Diagnostic` records. Unexpected programming or infrastructure
+errors propagate so the controller can expose its collapsed technical
+diagnostic. A `ProgressEvent` has a stable domain kind:
+`validating_inputs`, `preparing_subcatchment`, `simulating_interval`,
+`draining`, or `assembling_results`. The controller decides how those events
+look; they are never Streamlit messages.
 
-## Unit conventions
+`PreparationCache` caches only a `PreparedPlan`, keyed by a fingerprint of the
+spatial source and its relevant settings. The plan freezes its arrays during
+preparation. Runtime state, callbacks/events, scenario session data,
+visualizations, and exports are deliberately not cached.
+
+## Unit and result semantics
 
 | Quantity | Internal / output unit |
 | --- | --- |
@@ -38,12 +67,11 @@ Timestamps must be regular, unique and gap-free. Choose the matching value type 
 | Routed and reservoir outflow | m3 per model timestep |
 | Reported discharge | m3/s |
 | Water level | m TAW |
-| Maximum water-depth GeoTIFF | m |
+| Maximum water depth | m |
+| Flooded depth-class area | ha |
 
-## Result semantics
-
-The outlet CSV contains hydrographs only for terminal outlets: subcatchments that do not feed an inlet of another modelled subcatchment. This avoids presenting the same routed water at an upstream outlet and again downstream. The summary CSV contains one row per reported subcatchment plus a `whole_catchment` row. Its depth-class fields are the direct sum of the per-subcatchment class areas, rather than a merged-raster calculation. Depth classes are mutually exclusive: lower bound inclusive and upper bound exclusive, with the last class at least 2 m. All flooded-depth-class area fields are hectares.
-
-## Important model limitation
-
-The travel-time response is recomputed each timestep using current rainfall and channel flow. This is a rapid scenario model, not a calibrated hydrodynamic model. The revised UI exposes scale diagnostics, but realism still needs validation against observed rainfall and discharge before decisions are based on absolute values.
+The outlet table contains hydrographs only for terminal outlets, avoiding a
+double count of water routed from an upstream subcatchment into another one.
+The summary contains every subcatchment plus a `whole_catchment` row. Its
+flooded-depth-class fields are the direct sum of mutually exclusive
+subcatchment areas, not a merged-raster calculation.
