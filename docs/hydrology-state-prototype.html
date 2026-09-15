@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — Hoge Beek water ledger</title>
+  <style>
+    :root { --ink:#17222b; --muted:#64727d; --paper:#f6f4ef; --card:#fff; --accent:#087f73; --line:#d9dedb; --warn:#a44916; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.45 system-ui,sans-serif; }
+    main { max-width:1120px; margin:auto; padding:40px 24px 80px; }
+    h1,h2,h3 { line-height:1.15; }
+    h1 { margin-bottom:8px; }
+    .eyebrow { color:var(--accent); font-weight:750; letter-spacing:.08em; text-transform:uppercase; font-size:13px; }
+    .lede { max-width:860px; color:var(--muted); font-size:18px; }
+    .notice { border-left:4px solid var(--warn); padding:12px 16px; background:#fff8ef; margin:24px 0; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; }
+    .wide { grid-column:1/-1; }
+    dl { display:grid; grid-template-columns:1fr auto; gap:8px 18px; margin:0; }
+    dt { color:var(--muted); } dd { margin:0; font-variant-numeric:tabular-nums; font-weight:650; }
+    button,select { font:inherit; }
+    button { border:1px solid var(--accent); border-radius:8px; background:var(--accent); color:#fff; padding:10px 14px; cursor:pointer; }
+    button.secondary { background:#fff; color:var(--accent); }
+    button:disabled { opacity:.4; cursor:not-allowed; }
+    .buttons { display:flex; flex-wrap:wrap; gap:10px; }
+    .mode { display:flex; align-items:center; gap:12px; margin:18px 0; }
+    select { padding:8px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+    .balance { font-size:24px; color:var(--accent); }
+    .bad { color:#b42318; }
+    .queue { display:flex; gap:5px; margin-top:8px; }
+    .bucket { flex:1; min-width:42px; padding:8px 4px; text-align:center; border:1px solid var(--line); border-radius:6px; }
+    .bucket small { display:block; color:var(--muted); }
+    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+    .tabs button { background:#fff; color:var(--accent); }
+    .tabs button.active { background:var(--accent); color:#fff; }
+    .step { display:flex; align-items:center; justify-content:space-between; gap:12px; border-top:1px solid var(--line); padding:12px 0; }
+    .log { max-height:260px; overflow:auto; font-size:14px; }
+    .log p { border-top:1px solid var(--line); padding-top:8px; }
+    code { background:#edf1ef; padding:2px 5px; border-radius:4px; }
+    @media (max-width:760px) { .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Throwaway logic prototype</div>
+  <h1>Can every cubic metre be accounted for?</h1>
+  <p class="lede">This demo tests the proposed timestep and coupling state model: every rainfall interval is consumed, effective water waits in explicit travel queues, upstream outflow reaches the downstream subcatchment one interval later, and the ledger always balances.</p>
+  <div class="notice"><strong>What to challenge:</strong> Should rainfall timestamps mark interval starts? Should upstream transfer wait one interval? Should a run continue with dry drain intervals? Use the walkthroughs, then compare the proposed model with the legacy “skip first rainfall” behavior.</div>
+
+  <div class="mode">
+    <label for="mode"><strong>Interval behavior</strong></label>
+    <select id="mode">
+      <option value="proposed">Proposed: process interval zero</option>
+      <option value="legacy">Legacy artifact: skip interval zero</option>
+    </select>
+  </div>
+
+  <section class="grid">
+    <article class="card wide">
+      <h2>Whole-system ledger</h2>
+      <dl>
+        <dt>Intervals advanced</dt><dd id="interval">0</dd>
+        <dt>Effective volume implied by supplied records</dt><dd id="supplied">0.000 m³</dd>
+        <dt>Effective rainfall generated</dt><dd id="generated">0.000 m³</dd>
+        <dt>Terminal outflow</dt><dd id="terminal">0.000 m³</dd>
+        <dt>Water still in the system</dt><dd id="retained">0.000 m³</dd>
+        <dt>Balance residual</dt><dd id="residual" class="balance">0.000000 m³</dd>
+      </dl>
+    </article>
+    <article class="card">
+      <h2>Upper subcatchment</h2>
+      <p>50% runoff, 10,000 m²; one-interval spatial travel; Q-controlled outlet.</p>
+      <dl>
+        <dt>Travel queue</dt><dd id="aTransit">0.000 m³</dd>
+        <dt>Outlet storage</dt><dd id="aStorage">0.000 m³</dd>
+        <dt>Latest outlet outflow</dt><dd id="aOut">0.000 m³/interval</dd>
+        <dt>Queued for lower inlet</dt><dd id="coupling">0.000 m³</dd>
+      </dl>
+      <div id="aQueue" class="queue"></div>
+    </article>
+    <article class="card">
+      <h2>Lower subcatchment</h2>
+      <p>25% runoff, 16,000 m²; zero-interval spatial travel; H-controlled outlet with 8 m³ capacity.</p>
+      <dl>
+        <dt>Travel queue</dt><dd id="bTransit">0.000 m³</dd>
+        <dt>Outlet storage</dt><dd id="bStorage">0.000 m³</dd>
+        <dt>Latest terminal outflow</dt><dd id="bOut">0.000 m³/interval</dd>
+        <dt>Water level (illustrative)</dt><dd id="bLevel">10.000 m TAW</dd>
+      </dl>
+      <div id="bQueue" class="queue"></div>
+    </article>
+    <article class="card wide">
+      <h2>Free play</h2>
+      <p>Each button advances one complete interval. Rainfall depths apply uniformly to both subcatchments.</p>
+      <div class="buttons">
+        <button data-action="rain10">Advance with 10 mm rain</button>
+        <button data-action="rain2">Advance with 2 mm rain</button>
+        <button data-action="dry" class="secondary">Advance dry interval</button>
+        <button id="reset" class="secondary">Reset all state</button>
+      </div>
+    </article>
+    <article class="card wide">
+      <h2>Guided walkthroughs</h2>
+      <div class="tabs" id="tabs"></div>
+      <div id="scenario"></div>
+    </article>
+    <article class="card wide">
+      <h2>What changed each interval</h2>
+      <div id="log" class="log"><p>No interval has run.</p></div>
+    </article>
+  </section>
+</main>
+<script>
+// Pure, portable model module. It knows nothing about the page around it.
+const WaterLedger = (() => {
+  const EPS = 1e-9;
+  const initial = mode => ({
+    mode, k: 0, supplied: 0, generated: 0, terminal: 0,
+    a: { queue:[0,0], storage:0, out:0 },
+    b: { queue:[0], storage:0, out:0 },
+    coupling:[0], log:[]
+  });
+  const sum = xs => xs.reduce((a,b) => a+b, 0);
+  const generated = (rainMm, areaM2, runoff) => rainMm * runoff * .001 * areaM2;
+  const shiftIn = (queue, volume, lag) => {
+    const q = queue.slice();
+    while (q.length <= lag) q.push(0);
+    q[lag] += volume;
+    const arriving = q.shift();
+    q.push(0);
+    return { queue:q, arriving };
+  };
+  const qOutlet = (storage, inflow, dt=3600, k=1/7200, qmax=.001) => {
+    const decay = Math.exp(-k*dt);
+    const endUncapped = storage*decay + inflow*(1-decay)/(k*dt);
+    const integrated = Math.max(0, storage + inflow - endUncapped);
+    const out = Math.min(storage + inflow, integrated, qmax*dt);
+    return { storage:storage+inflow-out, out };
+  };
+  const hOutlet = (storage, inflow, capacity=8) => {
+    const available = storage+inflow;
+    return { storage:Math.min(available,capacity), out:Math.max(0,available-capacity) };
+  };
+  const retained = s => sum(s.a.queue)+s.a.storage+sum(s.b.queue)+s.b.storage+sum(s.coupling);
+  const residual = s => s.supplied-s.terminal-retained(s);
+  const advance = (state, rainMm) => {
+    const s = structuredClone(state);
+    const skipped = s.mode === 'legacy' && s.k === 0;
+    s.supplied += generated(rainMm,10000,.50) + generated(rainMm,16000,.25);
+    const rain = skipped ? 0 : rainMm;
+    const localA = generated(rain,10000,.50);
+    const localB = generated(rain,16000,.25);
+    s.generated += localA+localB;
+    const upstreamArrival = s.coupling.shift() || 0;
+    s.coupling.push(0);
+    const aq = shiftIn(s.a.queue,localA,1); s.a.queue=aq.queue;
+    const bq = shiftIn(s.b.queue,localB+upstreamArrival,0); s.b.queue=bq.queue;
+    const ar = qOutlet(s.a.storage,aq.arriving); s.a.storage=ar.storage; s.a.out=ar.out;
+    const br = hOutlet(s.b.storage,bq.arriving); s.b.storage=br.storage; s.b.out=br.out;
+    s.coupling[s.coupling.length-1] += ar.out;
+    s.terminal += br.out;
+    s.log.unshift(`Interval ${s.k}: ${rainMm} mm supplied${skipped ? ' — legacy mode discarded it' : ''}; ${
+      (localA+localB).toFixed(3)} m³ effective water generated; ${br.out.toFixed(3)} m³ left the terminal outlet.`);
+    s.k += 1;
+    if (Math.abs(residual(s)) > EPS) s.log.unshift('WARNING: the water ledger does not balance.');
+    return s;
+  };
+  return { initial, advance, retained, residual };
+})();
+
+const scenarios = [
+  { name:'First interval', text:'A wet first interval must create water. Switch to legacy mode and repeat to see the silent loss from the supplied rainfall record.', steps:[['Run first 10 mm interval',10]] },
+  { name:'Travel delay', text:'Rain in the upper subcatchment waits in its spatial queue. Dry intervals advance that water; they do not erase it.', steps:[['Run 10 mm rain',10],['Advance one dry interval',0],['Advance another dry interval',0]] },
+  { name:'Coupling', text:'Upper outlet outflow is placed in a transfer queue and becomes lower inlet volume in the next interval, independent of subcatchment calculation order.', steps:[['Run 10 mm rain',10],['Advance dry: upper water reaches its store',0],['Advance dry: upper outflow queues',0],['Advance dry: transfer reaches lower inlet',0]] },
+  { name:'Drain tail', text:'After rain ends, continue dry intervals. Terminal outflow and retained state together must still equal all generated effective water.', steps:[['Run 2 mm rain',2],['Drain 1',0],['Drain 2',0],['Drain 3',0],['Drain 4',0]] }
+];
+
+let state = WaterLedger.initial('proposed');
+let selected = 0;
+let step = 0;
+const $ = id => document.getElementById(id);
+const fmt = x => `${x.toFixed(3)} m³`;
+function queue(el, values) { el.innerHTML=values.map((v,i)=>`<div class="bucket"><small>lag ${i}</small>${v.toFixed(2)}</div>`).join(''); }
+function render() {
+  $('interval').textContent=state.k; $('supplied').textContent=fmt(state.supplied); $('generated').textContent=fmt(state.generated);
+  $('terminal').textContent=fmt(state.terminal); $('retained').textContent=fmt(WaterLedger.retained(state));
+  const r=WaterLedger.residual(state); $('residual').textContent=`${r.toFixed(6)} m³`; $('residual').className=`balance ${Math.abs(r)>1e-9?'bad':''}`;
+  $('aTransit').textContent=fmt(state.a.queue.reduce((a,b)=>a+b,0)); $('aStorage').textContent=fmt(state.a.storage); $('aOut').textContent=fmt(state.a.out)+'/interval';
+  $('coupling').textContent=fmt(state.coupling.reduce((a,b)=>a+b,0)); $('bTransit').textContent=fmt(state.b.queue.reduce((a,b)=>a+b,0));
+  $('bStorage').textContent=fmt(state.b.storage); $('bOut').textContent=fmt(state.b.out)+'/interval'; $('bLevel').textContent=(10+state.b.storage/20).toFixed(3)+' m TAW';
+  queue($('aQueue'),state.a.queue); queue($('bQueue'),state.b.queue);
+  $('log').innerHTML=state.log.length?state.log.map(x=>`<p>${x}</p>`).join(''):'<p>No interval has run.</p>';
+  renderScenario();
+}
+function reset() { state=WaterLedger.initial($('mode').value); step=0; render(); }
+function run(rain) { state=WaterLedger.advance(state,rain); render(); }
+function renderTabs() {
+  $('tabs').innerHTML=scenarios.map((s,i)=>`<button class="${i===selected?'active':''}" data-tab="${i}">${s.name}</button>`).join('');
+  document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{ selected=+b.dataset.tab; reset(); renderTabs(); });
+}
+function renderScenario() {
+  const s=scenarios[selected];
+  $('scenario').innerHTML=`<p>${s.text}</p>`+s.steps.map((x,i)=>`<div class="step"><span>${i+1}. ${x[0]}</span><button data-step="${i}" ${i!==step?'disabled':''}>Advance</button></div>`).join('');
+  document.querySelectorAll('[data-step]').forEach(b=>b.onclick=()=>{ run(s.steps[+b.dataset.step][1]); step++; render(); });
+}
+document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>run(b.dataset.action==='rain10'?10:b.dataset.action==='rain2'?2:0));
+$('reset').onclick=reset; $('mode').onchange=reset;
+renderTabs(); render();
+</script>
+</body>
+</html>
