@@ -45,8 +45,8 @@
 <main>
   <div class="eyebrow">Throwaway logic prototype</div>
   <h1>Can every cubic metre be accounted for?</h1>
-  <p class="lede">This demo tests the proposed timestep and coupling state model: every rainfall interval is consumed, effective water waits in explicit travel queues, upstream outflow reaches the downstream subcatchment one interval later, and the ledger always balances.</p>
-  <div class="notice"><strong>What to challenge:</strong> Should rainfall timestamps mark interval starts? Should upstream transfer wait one interval? Should a run continue with dry drain intervals? Use the walkthroughs, then compare the proposed model with the legacy “skip first rainfall” behavior.</div>
+  <p class="lede">This demo validates the timestep and coupling state model: every rainfall interval is consumed, effective water waits in explicit spatial travel queues, upstream outflow is downstream inlet volume in the same interval, and the ledger always balances.</p>
+  <div class="notice"><strong>Accepted model:</strong> rainfall timestamps mark interval starts; a shared outlet/inlet boundary adds no hidden delay; and a run continues with dry drain intervals. Compare this with the legacy “skip first rainfall” behavior.</div>
 
   <div class="mode">
     <label for="mode"><strong>Interval behavior</strong></label>
@@ -75,7 +75,7 @@
         <dt>Travel queue</dt><dd id="aTransit">0.000 m³</dd>
         <dt>Outlet storage</dt><dd id="aStorage">0.000 m³</dd>
         <dt>Latest outlet outflow</dt><dd id="aOut">0.000 m³/interval</dd>
-        <dt>Queued for lower inlet</dt><dd id="coupling">0.000 m³</dd>
+        <dt>Latest same-interval boundary transfer</dt><dd id="coupling">0.000 m³</dd>
       </dl>
       <div id="aQueue" class="queue"></div>
     </article>
@@ -119,7 +119,7 @@ const WaterLedger = (() => {
     mode, k: 0, supplied: 0, generated: 0, terminal: 0,
     a: { queue:[0,0], storage:0, out:0 },
     b: { queue:[0], storage:0, out:0 },
-    coupling:[0], log:[]
+    boundaryTransfer:0, log:[]
   });
   const sum = xs => xs.reduce((a,b) => a+b, 0);
   const generated = (rainMm, areaM2, runoff) => rainMm * runoff * .001 * areaM2;
@@ -142,7 +142,7 @@ const WaterLedger = (() => {
     const available = storage+inflow;
     return { storage:Math.min(available,capacity), out:Math.max(0,available-capacity) };
   };
-  const retained = s => sum(s.a.queue)+s.a.storage+sum(s.b.queue)+s.b.storage+sum(s.coupling);
+  const retained = s => sum(s.a.queue)+s.a.storage+sum(s.b.queue)+s.b.storage;
   const residual = s => s.supplied-s.terminal-retained(s);
   const advance = (state, rainMm) => {
     const s = structuredClone(state);
@@ -152,13 +152,11 @@ const WaterLedger = (() => {
     const localA = generated(rain,10000,.50);
     const localB = generated(rain,16000,.25);
     s.generated += localA+localB;
-    const upstreamArrival = s.coupling.shift() || 0;
-    s.coupling.push(0);
     const aq = shiftIn(s.a.queue,localA,1); s.a.queue=aq.queue;
-    const bq = shiftIn(s.b.queue,localB+upstreamArrival,0); s.b.queue=bq.queue;
     const ar = qOutlet(s.a.storage,aq.arriving); s.a.storage=ar.storage; s.a.out=ar.out;
+    s.boundaryTransfer=ar.out;
+    const bq = shiftIn(s.b.queue,localB+ar.out,0); s.b.queue=bq.queue;
     const br = hOutlet(s.b.storage,bq.arriving); s.b.storage=br.storage; s.b.out=br.out;
-    s.coupling[s.coupling.length-1] += ar.out;
     s.terminal += br.out;
     s.log.unshift(`Interval ${s.k}: ${rainMm} mm supplied${skipped ? ' — legacy mode discarded it' : ''}; ${
       (localA+localB).toFixed(3)} m³ effective water generated; ${br.out.toFixed(3)} m³ left the terminal outlet.`);
@@ -172,7 +170,7 @@ const WaterLedger = (() => {
 const scenarios = [
   { name:'First interval', text:'A wet first interval must create water. Switch to legacy mode and repeat to see the silent loss from the supplied rainfall record.', steps:[['Run first 10 mm interval',10]] },
   { name:'Travel delay', text:'Rain in the upper subcatchment waits in its spatial queue. Dry intervals advance that water; they do not erase it.', steps:[['Run 10 mm rain',10],['Advance one dry interval',0],['Advance another dry interval',0]] },
-  { name:'Coupling', text:'Upper outlet outflow is placed in a transfer queue and becomes lower inlet volume in the next interval, independent of subcatchment calculation order.', steps:[['Run 10 mm rain',10],['Advance dry: upper water reaches its store',0],['Advance dry: upper outflow queues',0],['Advance dry: transfer reaches lower inlet',0]] },
+  { name:'Coupling', text:'The upper subcatchment is evaluated first. Its outlet outflow immediately becomes lower inlet volume for that same interval; only the lower spatial route and outlet storage may delay it.', steps:[['Run 10 mm rain',10],['Advance dry: upper water arrives and crosses the shared boundary',0],['Advance dry: stored water continues to release',0]] },
   { name:'Drain tail', text:'After rain ends, continue dry intervals. Terminal outflow and retained state together must still equal all generated effective water.', steps:[['Run 2 mm rain',2],['Drain 1',0],['Drain 2',0],['Drain 3',0],['Drain 4',0]] }
 ];
 
@@ -187,7 +185,7 @@ function render() {
   $('terminal').textContent=fmt(state.terminal); $('retained').textContent=fmt(WaterLedger.retained(state));
   const r=WaterLedger.residual(state); $('residual').textContent=`${r.toFixed(6)} m³`; $('residual').className=`balance ${Math.abs(r)>1e-9?'bad':''}`;
   $('aTransit').textContent=fmt(state.a.queue.reduce((a,b)=>a+b,0)); $('aStorage').textContent=fmt(state.a.storage); $('aOut').textContent=fmt(state.a.out)+'/interval';
-  $('coupling').textContent=fmt(state.coupling.reduce((a,b)=>a+b,0)); $('bTransit').textContent=fmt(state.b.queue.reduce((a,b)=>a+b,0));
+  $('coupling').textContent=fmt(state.boundaryTransfer); $('bTransit').textContent=fmt(state.b.queue.reduce((a,b)=>a+b,0));
   $('bStorage').textContent=fmt(state.b.storage); $('bOut').textContent=fmt(state.b.out)+'/interval'; $('bLevel').textContent=(10+state.b.storage/20).toFixed(3)+' m TAW';
   queue($('aQueue'),state.a.queue); queue($('bQueue'),state.b.queue);
   $('log').innerHTML=state.log.length?state.log.map(x=>`<p>${x}</p>`).join(''):'<p>No interval has run.</p>';

@@ -1,7 +1,7 @@
 # Conceptual hydrological model (draft for review)
 
-> Status: decision prototype for “Define the conceptual hydrological model and
-> conservation invariants”. This is not yet the accepted production contract.
+> Status: validated decision captured by the prototype for “Define the conceptual
+> hydrological model and conservation invariants”.
 
 ## Purpose and boundary
 
@@ -60,14 +60,15 @@ interval. The model processes every interval exactly once, including `k = 0`.
 For each interval, the state transition is:
 
 ```text
-given state at interval start
+given all states at interval start
   1. consume P[k]
-  2. receive upstream outflow produced in interval k-1
-  3. generate effective cell volumes
-  4. enqueue them by spatial travel-time lag
-  5. release volumes whose lag expires into outlet storage
-  6. route outlet storage and determine O[k]
-  7. record O[k] for the interval and water level H[k+1] at interval end
+  2. visit subcatchments in topological upstream-to-downstream order
+  3. generate effective cell volumes for the current subcatchment
+  4. receive current-interval outflow from its upstream subcatchments
+  5. enqueue local and inlet volumes by spatial travel-time lag
+  6. release volumes whose lag expires into outlet storage
+  7. route outlet storage and determine O[k]
+  8. record O[k] for the interval and water level H[k+1] at interval end
 ```
 
 An output interval should therefore carry both `interval_start` and
@@ -132,13 +133,20 @@ delete water already queued under an earlier interval's response.
 
 ## Coupled subcatchments
 
-If subcatchment `u` feeds an inlet of subcatchment `d`, `O[u,k]` becomes inlet
-volume for `d` in interval `k+1`. This explicit one-interval coupling:
+If subcatchment `u` feeds an inlet of subcatchment `d`, `O[u,k]` is inlet volume
+for `d` in the same interval `k`:
 
-- is independent of iteration order;
-- preserves the present coupling contract;
-- gives the downstream spatial route responsibility for travel from inlet to
+- the shared outlet/inlet boundary has no implicit storage or travel time;
+- subcatchments are evaluated in a deterministic topological order, independent
+  of their input row order;
+- the downstream spatial route remains responsible for travel from inlet to
   downstream outlet.
+
+Using `O[u,k]` only in interval `k+1` would insert an artificial delay of exactly
+`Δt`. If a physical connection needs additional storage or travel time, model
+that state explicitly rather than hiding it in the coupling schedule. Treat each
+interval volume as the average boundary forcing over that interval; use smaller
+internal timesteps if this approximation is too coarse.
 
 Multiple upstream outlets entering the same inlet cell are summed. The
 subcatchment graph must be acyclic, all referenced source IDs must exist, and
@@ -197,7 +205,13 @@ For the whole coupled system from start through interval `N`:
 ```text
 Σ generated effective volume
 = Σ terminal outflow + Σ final outlet storage + Σ final travel queues
-   + Σ final inter-subcatchment transfer queues
+```
+
+The shared subcatchment boundary holds no water, so there is no separate
+inter-subcatchment transfer queue in the balance:
+
+```text
+upstream outflow volume in interval k = downstream inlet volume in interval k
 ```
 
 Upstream outflow transferred internally is not also counted as terminal outflow.
@@ -267,13 +281,13 @@ With 8 m³ available and `Qmax Δt = 3 m³`, outflow is at most 3 m³ and at lea
 
 ## Present behavior: rule or artifact?
 
-| Present behavior | Classification for confirmation |
+| Present behavior | Classification |
 | --- | --- |
 | Rainfall is normalized to depth per model interval | Essential rule |
 | Cell runoff percentage transforms rainfall to effective depth | Essential rule |
 | D8 distributed travel time with separate hillslope/channel velocities | Essential rule |
 | Outlet Q- and H-controlled stores | Essential rule |
-| Upstream outlet volume enters downstream one interval later | Preserve as explicit numerical rule |
+| Upstream outlet volume enters downstream one interval later | Accidental scheduling artifact; couple in the same interval |
 | First rainfall record is skipped | Accidental artifact; remove |
 | `tv_convolve_next` sums the newest response column instead of advancing lag diagonals | Accidental artifact; spatial delay is currently ineffective |
 | Lag bins can exclude the cell at the maximum travel time | Accidental artifact; loses volume |
@@ -283,14 +297,14 @@ With 8 m³ available and `Qmax Δt = 3 m³`, outflow is at most 3 m³ and at lea
 | Level-volume interpolation silently clamps beyond its sampled range | Numerical artifact; reject or extend the curve |
 | Maximum 200 travel bins are spread over the full travel-time range | Performance approximation; retain only behind an explicit accuracy tolerance |
 
-## Human confirmation requested
+## Accepted decisions
 
-Accept or amend these four connected choices before this draft becomes the model
-contract:
+The model contract adopts these four connected choices:
 
 1. timestamps label interval starts and every supplied interval, including the
    first, is processed;
-2. upstream outflow is transferred with one explicit interval of delay;
+2. upstream outflow is downstream inlet volume in the same interval, evaluated
+   in topological upstream-to-downstream order;
 3. dry drain intervals extend beyond the rainfall input, with residual water
    reported at a safety limit;
 4. Q-controlled storage uses integrated, capacity-limited outflow rather than the
