@@ -28,8 +28,8 @@ _Avoid_: flow volume, Q when the unit is not stated
 Absolute simulated water-surface elevation, expressed in metres TAW.
 _Avoid_: flood depth
 
-**Flooded area**:
-The estimated maximum area in a subcatchment where the simulated water depth reaches at least a stated threshold at any time during one simulation, expressed in hectares. Dashboard outputs use thresholds of 0.01 m and 0.10 m.
+**Flooded depth class area**:
+The estimated maximum area in a subcatchment in one mutually exclusive water-depth class during one simulation, expressed in hectares. The reported classes are 0.01–0.25 m, 0.25–0.50 m, 0.50–1 m, 1–2 m, and more than 2 m. The whole-catchment total is the sum of these subcatchment areas.
 _Avoid_: wet area, inundation risk
 
 **Water depth**:

@@ -16,7 +16,7 @@ from rainfall import (
     DEPTH_COLUMN, INTENSITY_COLUMN, prepare_rainfall, rainfall_diagnostics,
     waterinfo_value_kind as detect_waterinfo_value_kind,
 )
-from reporting import build_output_tables
+from reporting import build_output_tables, build_results_zip
 from visualization import build_detail_charts, build_waterdepth_map
 from hydrology import (
     DIRECTION_MAP, accumulate_travel_time, compute_effective_recharge,
@@ -333,10 +333,19 @@ def render_event_summary_metrics(summary: pd.Series, total_rainfall_mm: float):
     first_row[0].metric("Totale neerslag", f"{total_rainfall_mm:.1f} mm")
     first_row[1].metric("Piekafvoer", f"{summary['peak_discharge_m3s']:.3g} m³/s")
     first_row[2].metric("Maximale waterdiepte", f"{summary.get('max_water_depth_m', np.nan):.2f} m")
-    second_row = st.columns(3)
-    second_row[0].metric("Overstroomd oppervlak ≥0,01 m", f"{summary.get('flooded_area_0_01m_ha', np.nan):.2f} ha")
-    second_row[1].metric("Overstroomd oppervlak ≥0,10 m", f"{summary.get('flooded_area_0_10m_ha', np.nan):.2f} ha")
-    second_row[2].metric("Tijd tot piek", time_to_peak_label)
+    depth_classes = (
+        ("0,01–0,25 m", "flooded_area_0_01_to_0_25m_ha"),
+        ("0,25–0,50 m", "flooded_area_0_25_to_0_50m_ha"),
+        ("0,50–1 m", "flooded_area_0_50_to_1m_ha"),
+        ("1–2 m", "flooded_area_1_to_2m_ha"),
+        ("> 2 m", "flooded_area_over_2m_ha"),
+    )
+    for column, (label, field) in zip(st.columns(3), depth_classes[:3]):
+        column.metric(label, f"{summary.get(field, np.nan):.2f} ha")
+    third_row = st.columns(3)
+    third_row[0].metric(depth_classes[3][0], f"{summary.get(depth_classes[3][1], np.nan):.2f} ha")
+    third_row[1].metric(depth_classes[4][0], f"{summary.get(depth_classes[4][1], np.nan):.2f} ha")
+    third_row[2].metric("Tijd tot piek", time_to_peak_label)
     st.caption(
         "Deze uitkomsten zijn modelschattingen voor scenarioverkenning, geen lokale voorspellingen."
     )
@@ -1290,9 +1299,6 @@ if run_button:
                 catchments,
                 inlets,
                 maatregelen,
-                slope_factor=slope_factor,
-                manning_factor=manning_factor,
-                runoff_factor=runoff_factor,
             )
 
             # Rainfall input is normalised at one explicit seam.  The model only
@@ -1387,6 +1393,10 @@ if run_button:
             # Output tables: model outflows are volumes [m3/timestep]; reporting
             # converts them once to stakeholder-facing discharge [m3/s].
             catchment_ids_sorted = sorted(int(c) for c in catchments.uitstroompunt_nummer.values)
+            terminal_outlet_ids = sorted(
+                set(catchment_ids_sorted)
+                - {source_id for inp in inputs.values() for source_id in inp["inlet_dict"]}
+            )
             df_Q, df_H, df_summary = build_output_tables(
                 times,
                 catchment_outflow_volumes,
@@ -1395,12 +1405,13 @@ if run_button:
                 rainfall_depths_mm=rf_timeseries["rf"].to_numpy(),
                 terrain_by_catchment={cid: inputs[cid]["dtm_catchment"] for cid in catchment_ids_sorted},
                 pixel_area_m2=L**2,
+                terminal_outlet_ids=set(terminal_outlet_ids),
             )
             df_rf = rf_timeseries.rename(
                 columns={"datum": "datetime", "rf": "rainfall_depth_mm"}
             )
             st.session_state["simulation_results"] = {
-                "catchment_ids": catchment_ids_sorted,
+                "catchment_ids": terminal_outlet_ids,
                 "discharges": df_Q,
                 "waterlevels": df_H,
                 "summary": df_summary,
@@ -1418,9 +1429,9 @@ if run_button:
 
             with plot_container.container():
                 st.markdown("#### Simulatieresultaten")
-                if catchment_ids_sorted:
+                if terminal_outlet_ids:
                     selected_cid = st.selectbox(
-                        "Stroomgebied", catchment_ids_sorted, key="initial_result_catchment"
+                        "Terminale uitlaat", terminal_outlet_ids, key="initial_result_catchment"
                     )
                     summary = df_summary.set_index("catchment_id").loc[selected_cid]
                     render_event_summary_metrics(summary, rf_diagnostics.total_depth_mm)
@@ -1513,11 +1524,7 @@ if run_button:
             outputs_zip = None
             with tempfile.TemporaryDirectory() as tmpd:
                 tmp_dir = Path(tmpd)
-                df_Q.to_csv(tmp_dir / "catchment_discharges_m3s.csv", index=False)
-                df_H.to_csv(tmp_dir / "catchment_waterlevels_m_taw.csv", index=False)
-                df_summary.to_csv(tmp_dir / "catchment_summary.csv", index=False)
                 rf_fname = f"rainfall_normalized_dt{int(timestep_minutes)}min.csv"
-                df_rf.to_csv(tmp_dir / rf_fname, index=False)
 
                 depth_files: List[Path] = []
 
@@ -1533,17 +1540,7 @@ if run_button:
                         depth_files.append(fp)
 
                 zip_fp = tmp_dir / f"hogebeek_outputs_dt{int(timestep_minutes)}min_max3days.zip"
-                with zipfile.ZipFile(zip_fp, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.write(tmp_dir / "catchment_discharges_m3s.csv", "catchment_discharges_m3s.csv")
-                    zf.write(tmp_dir / "catchment_waterlevels_m_taw.csv", "catchment_waterlevels_m_taw.csv")
-                    zf.write(tmp_dir / "catchment_summary.csv", "catchment_summary.csv")
-                    zf.write(tmp_dir / rf_fname, rf_fname)
-                    if export_depths:
-                        for fp in depth_files:
-                            zf.write(fp, f"max_waterdepth/{fp.name}")
-
-                with open(zip_fp, "rb") as f:
-                    outputs_zip = f.read()
+                outputs_zip = build_results_zip(df_Q, df_H, df_summary, df_rf, rf_fname, depth_files)
 
             with download_container:
                 st.markdown("#### Alle resultaten downloaden")
@@ -1568,7 +1565,7 @@ if "simulation_results" in st.session_state and not run_button:
         st.markdown("#### Simulatieresultaten")
         if results["catchment_ids"]:
             selected_cid = st.selectbox(
-                "Stroomgebied", results["catchment_ids"], key="result_catchment"
+                "Terminale uitlaat", results["catchment_ids"], key="result_catchment"
             )
             summary = results["summary"].set_index("catchment_id").loc[selected_cid]
             render_event_summary_metrics(summary, results["rainfall_diagnostics"].total_depth_mm)

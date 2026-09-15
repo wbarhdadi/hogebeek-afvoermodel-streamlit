@@ -36,6 +36,10 @@ Timestamps must be regular, unique and gap-free. Choose the matching value type 
 | Water level | m TAW |
 | Maximum water-depth GeoTIFF | m |
 
+## Result semantics
+
+The outlet CSV contains hydrographs only for terminal outlets: subcatchments that do not feed an inlet of another modelled subcatchment. This avoids presenting the same routed water at an upstream outlet and again downstream. The summary CSV contains one row per reported subcatchment plus a `whole_catchment` row. Its depth-class fields are the direct sum of the per-subcatchment class areas, rather than a merged-raster calculation. Depth classes are mutually exclusive: lower bound inclusive and upper bound exclusive, with the last class at least 2 m. All flooded-depth-class area fields are hectares.
+
 ## Important model limitation
 
 The travel-time response is recomputed each timestep using current rainfall and channel flow. This is a rapid scenario model, not a calibrated hydrodynamic model. The revised UI exposes scale diagnostics, but realism still needs validation against observed rainfall and discharge before decisions are based on absolute values.
