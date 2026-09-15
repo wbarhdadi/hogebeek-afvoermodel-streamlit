@@ -351,6 +351,66 @@ def render_event_summary_metrics(summary: pd.Series, total_rainfall_mm: float):
     )
 
 
+FLOODED_AREA_COLUMNS = (
+    "flooded_area_0_01_to_0_25m_ha",
+    "flooded_area_0_25_to_0_50m_ha",
+    "flooded_area_0_50_to_1m_ha",
+    "flooded_area_1_to_2m_ha",
+    "flooded_area_over_2m_ha",
+)
+
+
+def render_results_overview(results: dict):
+    """Render the map-free, catchment-wide scenario result overview."""
+    summary = results["summary"]
+    subcatchments = summary.loc[summary.get("summary_scope", "subcatchment") == "subcatchment"].copy()
+    total_rows = summary.loc[summary.get("summary_scope", "") == "sum_of_subcatchments"]
+    flooded_total = (
+        total_rows.iloc[0][list(FLOODED_AREA_COLUMNS)].sum()
+        if not total_rows.empty else subcatchments[list(FLOODED_AREA_COLUMNS)].sum().sum()
+    )
+
+    st.markdown("#### Simulatieresultaten")
+    st.caption("Snelle modelschattingen voor scenarioverkenning; geen lokale voorspellingen.")
+    total_metrics = total_rows.iloc[0] if not total_rows.empty else subcatchments[list(FLOODED_AREA_COLUMNS)].sum()
+    metric_columns = st.columns(3)
+    metric_columns[0].metric(
+        "Totaal overstroomd areaal (>= 0,01 m; som van subcatchments)",
+        f"{flooded_total:.2f} ha",
+    )
+    for column, label, metric_column in zip(
+        FLOODED_AREA_COLUMNS,
+        ("0,01–0,25 m", "0,25–0,50 m", "0,50–1 m", "1–2 m", "> 2 m"),
+        (1, 2, 0, 1, 2),
+    ):
+        metric_columns[metric_column].metric(label, f"{total_metrics.get(column, 0.0):.2f} ha")
+
+    st.markdown("#### Hydrograven per terminale uitlaat")
+    for catchment_id in results["catchment_ids"]:
+        st.markdown(f"##### Hydrograaf - terminale uitlaat {catchment_id}")
+        hydrograph, _ = build_detail_charts(
+            results["rainfall"], results["discharges"], results["waterlevels"],
+            catchment_id, results["timestep_minutes"],
+        )
+        st.altair_chart(hydrograph, width="stretch")
+
+    st.markdown("#### Gerangschikte subcatchments")
+    subcatchments["flooded_area_at_or_above_0_01m_ha"] = subcatchments[
+        list(FLOODED_AREA_COLUMNS)
+    ].sum(axis=1)
+    table_columns = ["catchment_id", "flooded_area_at_or_above_0_01m_ha", *FLOODED_AREA_COLUMNS, "peak_discharge_m3s"]
+    st.dataframe(
+        subcatchments.sort_values("flooded_area_at_or_above_0_01m_ha", ascending=False)[table_columns],
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "catchment_id": "Subcatchment",
+            "flooded_area_at_or_above_0_01m_ha": "Overstroomd areaal >= 0,01 m [ha]",
+            "peak_discharge_m3s": "Piekafvoer [m³/s]",
+        },
+    )
+
+
 # Toon bestaande logs (bij her-run)
 render_logs()
 
@@ -1428,8 +1488,8 @@ if run_button:
             }
 
             with plot_container.container():
-                st.markdown("#### Simulatieresultaten")
-                if terminal_outlet_ids:
+                render_results_overview(st.session_state["simulation_results"])
+                if False and terminal_outlet_ids:
                     selected_cid = st.selectbox(
                         "Terminale uitlaat", terminal_outlet_ids, key="initial_result_catchment"
                     )
@@ -1517,7 +1577,7 @@ if run_button:
                         st.caption("Kleurklasse: ≤0,10 m · ≤0,50 m · ≤1,00 m · >1,00 m")
                         st.dataframe(map_df.drop(columns=["latitude", "longitude", "depth_color"]),
                                      hide_index=True, width="stretch")
-                else:
+                elif False:
                     st.info("Geen stroomgebieden gevonden in de inputs.")
 
             # Exports
@@ -1541,6 +1601,10 @@ if run_button:
 
                 zip_fp = tmp_dir / f"hogebeek_outputs_dt{int(timestep_minutes)}min_max3days.zip"
                 outputs_zip = build_results_zip(df_Q, df_H, df_summary, df_rf, rf_fname, depth_files)
+                st.session_state["results_export"] = {
+                    "data": outputs_zip,
+                    "filename": zip_fp.name,
+                }
 
             with download_container:
                 st.markdown("#### Alle resultaten downloaden")
@@ -1562,8 +1626,8 @@ if run_button:
 if "simulation_results" in st.session_state and not run_button:
     results = st.session_state["simulation_results"]
     with plot_container.container():
-        st.markdown("#### Simulatieresultaten")
-        if results["catchment_ids"]:
+        render_results_overview(results)
+        if False and results["catchment_ids"]:
             selected_cid = st.selectbox(
                 "Terminale uitlaat", results["catchment_ids"], key="result_catchment"
             )
@@ -1586,5 +1650,16 @@ if "simulation_results" in st.session_state and not run_button:
                     ),
                     width="stretch",
                 )
-        else:
+        elif False:
             st.info("Geen stroomgebieden gevonden in de inputs.")
+
+    if "results_export" in st.session_state:
+        with download_container:
+            export = st.session_state["results_export"]
+            st.markdown("#### Alle resultaten downloaden")
+            st.download_button(
+                "Download ZIP met resultaten",
+                data=export["data"],
+                file_name=export["filename"],
+                mime="application/zip",
+            )
