@@ -68,7 +68,15 @@ def raster_cells() -> pd.DataFrame:
         for x in range(density):
             for y in range(density):
                 depth = max(0.0, item.max_depth_m * (1 - (x + y) / (2 * density)))
-                rows.append({"position": [west + .0012 * x, north - .0012 * y], "depth_m": depth, "colour": depth_colour(depth) + [170]})
+                cell_size = .0012
+                left, top = west + cell_size * x, north - cell_size * y
+                # Square polygons, rather than markers: the prototype must make
+                # clear what a maximum-water-depth raster actually looks like.
+                rows.append({
+                    "cell": [[left, top], [left + cell_size, top], [left + cell_size, top - cell_size], [left, top - cell_size]],
+                    "depth_m": depth,
+                    "colour": depth_colour(depth) + [170],
+                })
     return pd.DataFrame(rows)
 
 
@@ -83,7 +91,7 @@ def deck(show_raster: bool, comparison: bool = False) -> pdk.Deck:
     layers = [pdk.Layer("PolygonLayer", polygons, get_polygon="polygon", get_fill_color="fill", get_line_color="border", line_width_min_pixels=2, pickable=True)]
     if show_raster:
         cells = raster_cells()
-        layers.append(pdk.Layer("ScatterplotLayer", cells, get_position="position", get_fill_color="colour", get_radius=65 if not st.session_state.spatial_large_raster else 28, pickable=True))
+        layers.append(pdk.Layer("PolygonLayer", cells, get_polygon="cell", get_fill_color="colour", get_line_color=[255, 255, 255, 35], line_width_min_pixels=.25, pickable=True))
     return pdk.Deck(
         initial_view_state=pdk.ViewState(latitude=50.808, longitude=3.302, zoom=12.3, pitch=0),
         layers=layers,
