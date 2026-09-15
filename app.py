@@ -9,7 +9,18 @@ import numpy as np
 import pandas as pd
 import rasterio
 import streamlit as st
+import altair as alt
 from rasterio.transform import from_origin
+
+from rainfall import (
+    DEPTH_COLUMN, INTENSITY_COLUMN, prepare_rainfall, rainfall_diagnostics,
+    waterinfo_value_kind as detect_waterinfo_value_kind,
+)
+from reporting import build_output_tables
+from hydrology import (
+    DIRECTION_MAP, accumulate_travel_time, compute_effective_recharge,
+    route_Q_channel, tv_convolve_next,
+)
 
 # Probeer pywaterinfo te importeren
 try:
@@ -77,15 +88,15 @@ STATIONS = [
 # ============================================================
 
 st.set_page_config(
-    page_title="Hoge Beek – Travel-time model (Waterinfo, max 3 dagen)",
+    page_title="Hoge Beek - travel-time model",
     layout="wide",
 )
 
-st.title("Hoge Beek – Travel-time neerslag–afvoermodel (Waterinfo)")
+st.title("Hoge Beek - travel-time neerslag-afvoermodel")
 st.markdown(
     """
 Deze app draait het **Hoge Beek** travel-time / bakjesmodel op neerslag
-gedownload van **waterinfo.be** met `pywaterinfo`.
+geleverd via **Waterinfo** of een geüploade CSV.
 
 - Tijdstap: **gebruikerskeuze** (standaard 1 uur)
 - Maximale duur: **3 dagen** (totale simulatieperiode)
@@ -99,172 +110,12 @@ gedownload van **waterinfo.be** met `pywaterinfo`.
 
 **Neerslag:**
 
-- Wordt opgehaald bij **Waterinfo (VMM)** met een `ts_id` en begin–einddatum.
-- Standaardperiode: **2025-10-03** t.e.m. **2025-10-06** (3 dagen).
-- Wordt geaggregeerd naar de gekozen tijdstap en afgekapt op max. 3 dagen.
+- Kies Waterinfo (VMM) of een CSV met `datetime` en `rainfall_mm` (diepte) of
+  `rainfall_mmh` (intensiteit).
+- De app controleert de gekozen eenheid, tijdstap en regelmatigheid van de reeks.
+- Alle invoer wordt omgezet naar neerslagdiepte per modeltijdstap en afgekapt op maximaal 3 dagen.
 """
 )
-
-# ============================================================
-# MODEL HELPER FUNCTIES
-# ============================================================
-
-def compute_effective_recharge(P_current: float, ro_catchment: np.ndarray) -> np.ndarray:
-    """Effectieve neerslag (mm) = runoff (%) / 100 * P_current (mm)."""
-    ro = ro_catchment.copy().astype(float)
-    ro[ro == -9999] = np.nan
-    return ro / 100.0 * P_current
-
-
-DIRECTION_MAP = {
-    1: (-1, 1),
-    2: (0, 1),
-    4: (1, 1),
-    8: (1, 0),
-    16: (1, -1),
-    32: (0, -1),
-    64: (-1, -1),
-    128: (-1, 0),
-}
-
-
-def route_Q_channel(
-    fd_catchment: np.ndarray,
-    dtm_catchment: np.ndarray,
-    channel_mask: np.ndarray,
-    inlet_flow_dict: Dict[int, float],
-    inlet_indices_dict: Dict[int, Tuple[int, int]],
-    effective_rain_depth: np.ndarray,
-    outlet_indices: Tuple[int, int],
-    L: float,
-) -> np.ndarray:
-    """
-    Routeer debiet door kanaalcellen met D8-richtingen.
-    Volumes in m³ per tijdstap (T).
-    """
-    H, W = fd_catchment.shape
-    candidate_dict_sorted_by_dtm: Dict[Tuple[int, int], float] = {}
-    Q = np.zeros_like(fd_catchment, dtype=float)
-    processed = set()
-
-    chan_rows, chan_cols = np.where(channel_mask)
-    chan_dtm_vals = dtm_catchment[channel_mask]
-    sort_idx = np.argsort(chan_dtm_vals)
-
-    for idx in sort_idx:
-        r = int(chan_rows[idx])
-        c = int(chan_cols[idx])
-        cell_rc = (r, c)
-        candidate_dict_sorted_by_dtm[cell_rc] = float(dtm_catchment[cell_rc])
-
-    while len(candidate_dict_sorted_by_dtm) > 0:
-        current_cell = list(candidate_dict_sorted_by_dtm.keys())[-1]
-        candidate_dict_sorted_by_dtm.pop(current_cell)
-        prev_Q = 0.0
-
-        if current_cell in processed:
-            continue
-
-        while True:
-            r, c = current_cell
-            if current_cell not in processed:
-                exo = 0.0
-                # instroom vanuit bovenstroomse deelbekkens
-                for inlet_id, inlet_rc in inlet_indices_dict.items():
-                    if current_cell == inlet_rc:
-                        exo = float(inlet_flow_dict.get(inlet_id, 0.0))
-
-                # laterale instroom van hellingcellen
-                lateral = 0.0
-                for dr in (-1, 0, 1):
-                    for dc in (-1, 0, 1):
-                        if dr == 0 and dc == 0:
-                            continue
-                        nr, nc = r + dr, c + dc
-                        if nr < 0 or nr >= H or nc < 0 or nc >= W:
-                            continue
-                        code_n = fd_catchment[nr, nc]
-                        if np.isnan(code_n):
-                            continue
-                        # buur die afwatert naar (r, c)
-                        if DIRECTION_MAP.get(int(code_n)) == (r - nr, c - nc):
-                            depth = float(effective_rain_depth[nr, nc])
-                            if depth > 0.0:
-                                # mm -> m, maal pixeloppervlak -> m³
-                                lateral += depth * 0.001 * L**2
-
-                Q_here = prev_Q + exo + lateral
-                Q[current_cell] = Q_here
-                prev_Q = Q_here
-                processed.add(current_cell)
-            else:
-                Q[current_cell] += prev_Q
-
-            if current_cell == tuple(outlet_indices):
-                break
-            else:
-                dir_val = fd_catchment[current_cell]
-                if np.isnan(dir_val) or int(dir_val) not in DIRECTION_MAP:
-                    break
-                dr, dc = DIRECTION_MAP[int(dir_val)]
-                current_cell = (r + dr, c + dc)
-
-    return Q
-
-
-def accumulate_travel_time(
-    travel_time: np.ndarray,
-    flow_dir: np.ndarray,
-    outlet: Tuple[int, int],
-) -> np.ndarray:
-    """
-    Accumuleer reistijden langs D8-stroomlijnen naar de uitlaat.
-    Geeft een array terug met totale reistijd [s] van elke cel tot aan de uitlaat.
-    """
-    rows, cols = travel_time.shape
-    acc_time = np.full_like(travel_time, np.nan, dtype=float)
-    visited = np.zeros_like(travel_time, dtype=bool)
-
-    def follow_path(r: int, c: int) -> float:
-        if np.isnan(travel_time[r, c]):
-            return np.nan
-        if visited[r, c]:
-            return acc_time[r, c]
-
-        dir_val = flow_dir[r, c]
-        if np.isnan(dir_val) or int(dir_val) not in DIRECTION_MAP:
-            return np.inf
-
-        dr, dc = DIRECTION_MAP[int(dir_val)]
-        nr, nc = r + dr, c + dc
-
-        if (r, c) == outlet:
-            acc_time[r, c] = 0.0
-        else:
-            downstream_time = follow_path(nr, nc)
-            acc_time[r, c] = travel_time[r, c] + downstream_time
-
-        visited[r, c] = True
-        return acc_time[r, c]
-
-    for r in range(rows):
-        for c in range(cols):
-            follow_path(r, c)
-
-    return acc_time
-
-
-def tv_convolve_next(PU: np.ndarray, timestep: int) -> float:
-    """
-    Time-varying convolutie (alleen de volgende outputstap).
-
-    PU: (L, T_out) time-varying unit responses.
-        PU[lag, t_out] = respons op tijdstip t_out door een impuls lag stappen eerder.
-    """
-    PU = np.asarray(PU)
-    # Neem altijd de laatste kolom (huidige tijd) en sommeer over alle lags
-    return float(PU[:, -1].sum())
-
 
 # ============================================================
 # LOGGING (één plek, genummerd, zonder herhaling)
@@ -300,45 +151,50 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.subheader("Neerslag – Waterinfo (VMM)")
-
-    if not HAS_WATERINFO:
-        st.error("`pywaterinfo` is niet geïnstalleerd. Installeer met `pip install pywaterinfo`.")
-        timestep_minutes = 60
+    st.markdown("---")
+    st.subheader("Neerslag")
+    rainfall_source = st.radio("Bron", ["Waterinfo (VMM)", "CSV upload"])
+    # CSV has no trustworthy metadata, so the uploader must specify its unit.
+    # Waterinfo does: its unit is read from ts_unitsymbol during the download.
+    rainfall_value_kind = None
+    rainfall_csv_file = None
+    ts_id = None
+    start_date = None
+    end_date = None
+    if rainfall_source == "Waterinfo (VMM)":
+        st.caption("De neerslageenheid wordt automatisch gecontroleerd in de Waterinfo-reeksmetadata.")
+        if not HAS_WATERINFO:
+            st.error("pywaterinfo ontbreekt; kies CSV upload of installeer de dependency.")
+        else:
+            station_labels = [f"{name} ({sid})" for sid, name in STATIONS]
+            selected_label = st.selectbox("Station (neerslagreeks)", station_labels)
+            ts_id = selected_label.split("(")[-1].rstrip(")")
+            start_date = st.text_input("Begindatum (JJJJ-MM-DD)", value="2025-10-03")
+            end_date = st.text_input("Einddatum (JJJJ-MM-DD)", value="2025-10-06")
     else:
-        # Toon labels in dropdown, maar bewaar echte ts_id apart
-        station_labels = [f"{name} ({sid})" for sid, name in STATIONS]
-        
-        # Default: wat je nu als value gebruikte ("210400042") zit niet in je lijst,
-        # dus kiezen we een veilige default (eerste item). Je kan dit aanpassen.
-        default_index = 0
-        
-        selected_label = st.selectbox(
-            "Station (neerslagreeks)",
-            options=station_labels,
-            index=default_index,
-            help="Kies het station; de juiste Waterinfo ts_id wordt automatisch gebruikt.",
+        rainfall_value_kind_label = st.selectbox(
+            "Eenheid van aangeleverde CSV-waarden",
+            ["Neerslagdiepte [mm per interval]", "Neerslagintensiteit [mm/h]"],
+            help="Deze keuze is nodig omdat een CSV geen betrouwbare eenheidsmetadata bevat.",
         )
-        
-        # Haal ts_id uit het gekozen label (alles tussen haakjes)
-        selected_id = selected_label.split("(")[-1].rstrip(")")
-        ts_id = str(selected_id)
-
-        
-        start_date = st.text_input("Begindatum (JJJJ-MM-DD)", value="2025-10-03")
-        end_date = st.text_input("Einddatum (JJJJ-MM-DD)", value="2025-10-06")
-        timestep_minutes = st.number_input(
-            "Modeltijdstap [minuten]",
-            min_value=5,
-            max_value=180,
-            value=60,
-            step=5,
-            help="Tijdstap voor aggregatie van neerslag en modeltijd (max. 3 dagen totale duur).",
+        rainfall_value_kind = (
+            "depth" if rainfall_value_kind_label.startswith("Neerslagdiepte") else "intensity"
         )
+        rainfall_csv_file = st.file_uploader("Neerslag CSV", type=["csv"])
+        expected_column = DEPTH_COLUMN if rainfall_value_kind == "depth" else INTENSITY_COLUMN
         st.caption(
-            "Neerslag wordt opgehaald voor [start, einde], geaggregeerd naar de gekozen tijdstap "
-            "en afgekapt op maximaal 3 dagen."
+            f"Verplicht: `datetime` en `{expected_column}`. Timestamps moeten regelmatig en zonder hiaten zijn."
         )
+
+    timestep_minutes = st.number_input(
+        "Modeltijdstap [minuten]",
+        min_value=5,
+        max_value=180,
+        value=60,
+        step=5,
+        help="Tijdstap voor aggregatie van neerslag en modeltijd (max. 3 dagen totale duur).",
+    )
+    st.caption("De modeltijdstap moet een geheel veelvoud zijn van het interval in de neerslagreeks.")
 
     st.markdown("---")
     st.subheader("Modelparameters")
@@ -433,6 +289,7 @@ render_logs()
 def apply_maatregelen(
     geodata: gpd.GeoDataFrame,
     maatregelen_gdf: Optional[gpd.GeoDataFrame],
+    catchments: gpd.GeoDataFrame,
 ) -> gpd.GeoDataFrame:
     """
     Pas maatregelen toe op geodata:
@@ -719,7 +576,7 @@ def preprocess_geodata(
 
     # Maatregelen toepassen
     geodata_with_catchment_id = apply_maatregelen(
-        geodata_with_catchment_id, maatregelen
+        geodata_with_catchment_id, maatregelen, catchments
     )
 
     inputs: Dict[int, dict] = {}
@@ -902,9 +759,10 @@ class QReservoir:
             self.A * self.S * math.exp(-self.A * tres)
             + (Vin / tres) * (1.0 - math.exp(-self.A * tres))
         )
-        Qout_real = min(Qout_potential, self.Qmax * tres)
-
-        Vout = math.floor(Qout_real * tres * 1e5) / 1e5
+        # Qout_potential and Qmax are both rates [m3/s].  Convert to a volume
+        # only after capping the rate for this timestep.
+        Qout_real = min(Qout_potential, self.Qmax)
+        Vout = Qout_real * tres
 
         self.update_storage(Vin, Vout)
         self.t += tres
@@ -1105,7 +963,7 @@ def run_model(
     n_steps = len(P_event)
 
     catchment_ids = [int(c) for c in catchments.uitstroompunt_nummer.values]
-    catchment_discharges: Dict[int, np.ndarray] = {
+    catchment_outflow_volumes: Dict[int, np.ndarray] = {
         cid: np.zeros(n_steps, dtype=float) for cid in catchment_ids
     }
     catchment_waterlevels: Dict[int, np.ndarray] = {}
@@ -1136,7 +994,7 @@ def run_model(
 
             if inlet_ids:
                 discharge_in_array = np.array(
-                    [catchment_discharges[inlet_id][timestep - 1] for inlet_id in inlet_ids]
+                    [catchment_outflow_volumes[inlet_id][timestep - 1] for inlet_id in inlet_ids]
                 )
                 discharge_in_dict = {
                     inlet_id: incoming
@@ -1258,13 +1116,13 @@ def run_model(
             catchment_current_Q = tv_convolve_next(PU_total_padded, timestep)
 
             Vout = reservoirs[cid].transfer(catchment_current_Q, T)
-            catchment_discharges[cid][timestep] = Vout
+            catchment_outflow_volumes[cid][timestep] = Vout
             catchment_waterlevels[cid][timestep] = reservoirs[cid].get_waterlevel_from_volume(
                 reservoirs[cid].S
             )
 
     log("Stap: modelrun afgerond.")
-    return catchment_discharges, catchment_waterlevels, times, T
+    return catchment_outflow_volumes, catchment_waterlevels, times, T
 
 
 # ------------------------------------------------------------
@@ -1315,7 +1173,9 @@ if run_button:
     try:
         if geodata_file is None or catchments_file is None or inlets_file is None:
             st.error("Upload eerst geodata, catchments en `inlets_pts.gpkg`.")
-        elif not HAS_WATERINFO:
+        elif rainfall_source == "CSV upload" and rainfall_csv_file is None:
+            st.error("Upload een neerslag-CSV of kies Waterinfo als bron.")
+        elif rainfall_source == "Waterinfo (VMM)" and not HAS_WATERINFO:
             st.error(
                 "`pywaterinfo` is niet geïnstalleerd. "
                 "Installeer met `pip install pywaterinfo` en start de app opnieuw."
@@ -1353,34 +1213,51 @@ if run_button:
                 runoff_factor=runoff_factor,
             )
 
-            # Neerslag ophalen
-            log("Stap: neerslag downloaden van waterinfo.be (VMM)...")
-            vmm = Waterinfo("vmm")
-            df_raw = vmm.get_timeseries_values(
-                ts_id=str(ts_id),
-                start=start_date,
-                end=end_date,
+            # Rainfall input is normalised at one explicit seam.  The model only
+            # receives rainfall depth [mm] per model timestep.
+            if rainfall_source == "Waterinfo (VMM)":
+                vmm = Waterinfo("vmm")
+                # Waterinfo's default is to request every quality and comment
+                # field.  For minute rainfall this can make a tiny simulation
+                # request unnecessarily large and leave the Streamlit run looking
+                # stalled.  The model only needs these fields.
+                log("Stap: Waterinfo-eenheid ophalen...")
+                metadata = vmm.get_timeseries_list(
+                    ts_id=str(ts_id),
+                    returnfields="ts_id,ts_unitsymbol,stationparameter_longname",
+                )
+                rainfall_value_kind, waterinfo_unit = detect_waterinfo_value_kind(metadata)
+                log(f"Waterinfo-eenheid gecontroleerd via metadata: {waterinfo_unit} ({rainfall_value_kind}).")
+
+                log("Stap: neerslagwaarden downloaden van Waterinfo (VMM)...")
+                df_raw = vmm.get_timeseries_values(
+                    ts_id=str(ts_id),
+                    start=start_date,
+                    end=end_date,
+                    timezone="UTC",
+                    returnfields="Timestamp,Value",
+                )
+                if df_raw.empty:
+                    raise ValueError("Waterinfo gaf geen neerslagwaarden terug voor deze periode.")
+                log(f"Waterinfo-download klaar: {len(df_raw)} meetwaarden ontvangen.")
+                time_col = "Timestamp" if "Timestamp" in df_raw.columns else "timestamp"
+                if time_col not in df_raw.columns:
+                    time_col = df_raw.columns[0]
+                value_col = "Value" if "Value" in df_raw.columns else df_raw.columns[-1]
+            else:
+                log("Stap: neerslag-CSV inlezen en valideren...")
+                df_raw = pd.read_csv(rainfall_csv_file)
+                time_col = "datetime"
+                value_col = DEPTH_COLUMN if rainfall_value_kind == "depth" else INTENSITY_COLUMN
+
+            log(f"Stap: neerslag aggregeren naar {timestep_minutes} min met expliciete eenheden...")
+            rf_timeseries = prepare_rainfall(
+                df_raw,
+                value_kind=rainfall_value_kind,
+                timestep_minutes=int(timestep_minutes),
+                datetime_column=time_col,
+                value_column=value_col,
             )
-
-            # Tijd- en waarde-kolommen bepalen
-            time_col = "Timestamp" if "Timestamp" in df_raw.columns else "timestamp"
-            if time_col not in df_raw.columns:
-                time_col = df_raw.columns[0]
-            value_col = "Value" if "Value" in df_raw.columns else df_raw.columns[-1]
-
-            df_raw[time_col] = pd.to_datetime(df_raw[time_col])
-            df_raw = df_raw.sort_values(time_col)
-
-            freq_str = f"{int(timestep_minutes)}min"
-            log(f"Stap: neerslag her-samplen naar totalen per {timestep_minutes} min...")
-            rf_timeseries = (
-                df_raw
-                .set_index(time_col)[[value_col]]
-                .resample(freq_str)
-                .sum()
-                .reset_index()
-            )
-            rf_timeseries.columns = ["datum", "rf"]
 
             # Maximaal 3 dagen
             max_steps = int((3 * 24 * 60) // int(timestep_minutes))
@@ -1395,6 +1272,7 @@ if run_button:
                 f"Stap: neerslagreeks klaar – {len(rf_timeseries)} tijdstappen "
                 f"(Δt={timestep_minutes} min, ≤ {max_steps} stappen)."
             )
+            rf_diagnostics = rainfall_diagnostics(rf_timeseries, int(timestep_minutes))
 
             # Reservoirs
             log("Stap: reservoirs opbouwen...")
@@ -1412,7 +1290,7 @@ if run_button:
 
             # Modelrun
             log(f"Stap: modelrun starten (Δt={timestep_minutes} min, max. 3 dagen)...")
-            catchment_discharges, catchment_waterlevels, times, T = run_model(
+            catchment_outflow_volumes, catchment_waterlevels, times, T = run_model(
                 catchments,
                 inputs,
                 L,
@@ -1424,33 +1302,92 @@ if run_button:
 
             log("Stap: simulatie klaar – outputs voorbereiden...")
 
-            # Outputtabellen
+            # Output tables: model outflows are volumes [m3/timestep]; reporting
+            # converts them once to stakeholder-facing discharge [m3/s].
             catchment_ids_sorted = sorted(int(c) for c in catchments.uitstroompunt_nummer.values)
+            df_Q, df_H, df_summary = build_output_tables(
+                times, catchment_outflow_volumes, catchment_waterlevels, T
+            )
+            df_rf = rf_timeseries.rename(
+                columns={"datum": "datetime", "rf": "rainfall_depth_mm"}
+            )
 
-            df_Q = pd.DataFrame({"datum": times})
-            for cid in catchment_ids_sorted:
-                df_Q[f"totaal_afvoer_uitlaat{cid}"] = catchment_discharges[cid]
-
-            df_H = pd.DataFrame({"datum": times})
-            for cid in catchment_ids_sorted:
-                df_H[f"waterpeil_c{cid}"] = catchment_waterlevels[cid]
-
-            df_rf = rf_timeseries.copy()
-
-            # Eenvoudige plot
             with plot_container:
-                st.markdown("#### Voorbeeld-hydrogram (eerste stroomgebied)")
+                st.markdown("#### Simulatieresultaten")
                 if catchment_ids_sorted:
-                    first_cid = catchment_ids_sorted[0]
-                    df_plot = pd.DataFrame({
-                        "datum": times,
-                        "Q_m3": catchment_discharges[first_cid],
-                    })
-                    df_plot = df_plot.set_index("datum")
-                    st.line_chart(df_plot)
+                    selected_cid = st.selectbox(
+                        "Stroomgebied", catchment_ids_sorted, key="result_catchment"
+                    )
+                    summary = df_summary.set_index("catchment_id").loc[selected_cid]
+                    metric_a, metric_b, metric_c = st.columns(3)
+                    metric_a.metric("Totale neerslag", f"{rf_diagnostics.total_depth_mm:.1f} mm")
+                    metric_b.metric("Piekafvoer", f"{summary['peak_discharge_m3s']:.3g} m³/s")
+                    metric_c.metric("Maximaal waterpeil", f"{summary['max_water_level_m_taw']:.2f} m TAW")
+                    if rf_diagnostics.peak_intensity_mmh > 100:
+                        st.warning(
+                            f"Piekintensiteit is {rf_diagnostics.peak_intensity_mmh:.1f} mm/h. "
+                            "Controleer de gekozen neerslageenheid en brongegevens."
+                        )
 
-                    st.markdown(f"Neerslag [mm per {timestep_minutes} min]")
-                    st.bar_chart(df_rf.set_index("datum")["rf"])
+                    rainfall_chart = alt.Chart(df_rf).mark_bar(color="#4C78A8").encode(
+                        x=alt.X("datetime:T", title="Datum en tijd"),
+                        y=alt.Y("rainfall_depth_mm:Q", title=f"Neerslagdiepte [mm/{timestep_minutes} min]"),
+                        tooltip=["datetime:T", alt.Tooltip("rainfall_depth_mm:Q", format=".3f")],
+                    ).properties(title="Neerslag")
+                    discharge_column = f"discharge_catchment_{selected_cid}_m3s"
+                    discharge_chart = alt.Chart(df_Q).mark_line(color="#E45756").encode(
+                        x=alt.X("datetime:T", title="Datum en tijd"),
+                        y=alt.Y(f"{discharge_column}:Q", title="Afvoer [m³/s]"),
+                        tooltip=["datetime:T", alt.Tooltip(f"{discharge_column}:Q", format=".5g")],
+                    ).properties(title=f"Hydrogram — stroomgebied {selected_cid}")
+                    level_column = f"water_level_catchment_{selected_cid}_m_taw"
+                    waterlevel_chart = alt.Chart(df_H).mark_line(color="#72B7B2").encode(
+                        x=alt.X("datetime:T", title="Datum en tijd"),
+                        y=alt.Y(f"{level_column}:Q", title="Waterpeil [m TAW]"),
+                        tooltip=["datetime:T", alt.Tooltip(f"{level_column}:Q", format=".3f")],
+                    ).properties(title=f"Waterpeil — stroomgebied {selected_cid}")
+                    st.altair_chart(rainfall_chart, use_container_width=True)
+                    st.altair_chart(discharge_chart, use_container_width=True)
+                    st.altair_chart(waterlevel_chart, use_container_width=True)
+                    st.markdown("#### Samenvatting per stroomgebied")
+                    st.dataframe(df_summary, hide_index=True, use_container_width=True)
+
+                    # A readable spatial overview: one point per catchment,
+                    # coloured/scaled by the maximum simulated water depth.
+                    map_rows = []
+                    for cid in catchment_ids_sorted:
+                        geom = catchments.loc[
+                            catchments["uitstroompunt_nummer"].astype(int) == cid, "geometry"
+                        ]
+                        if geom.empty:
+                            continue
+                        hmax = float(np.nanmax(catchment_waterlevels[cid]))
+                        dtm = inputs[cid]["dtm_catchment"]
+                        max_depth = float(np.nanmax(np.maximum(hmax - dtm, 0.0)))
+                        point = geom.iloc[0].representative_point()
+                        map_rows.append({"catchment_id": cid, "latitude": point.y,
+                                         "longitude": point.x, "max_waterdepth_m": max_depth})
+                    if map_rows:
+                        st.markdown("#### Kaart maximale waterdiepte per stroomgebied")
+                        map_df = pd.DataFrame(map_rows)
+                        # st.map accepts CSS colours, rather than a numeric colour
+                        # scale.  Keep the depth numeric and map it to fixed,
+                        # interpretable blue depth classes for the marker colour.
+                        map_df["depth_color"] = np.select(
+                            [
+                                map_df["max_waterdepth_m"] <= 0.10,
+                                map_df["max_waterdepth_m"] <= 0.50,
+                                map_df["max_waterdepth_m"] <= 1.00,
+                            ],
+                            ["#cfe8f3", "#73bfe2", "#2878b5"],
+                            default="#08306b",
+                        )
+                        st.map(map_df, latitude="latitude", longitude="longitude",
+                               color="depth_color", size="max_waterdepth_m",
+                               zoom=12, use_container_width=True)
+                        st.caption("Kleurklasse: ≤0,10 m · ≤0,50 m · ≤1,00 m · >1,00 m")
+                        st.dataframe(map_df.drop(columns=["latitude", "longitude", "depth_color"]),
+                                     hide_index=True, use_container_width=True)
                 else:
                     st.info("Geen stroomgebieden gevonden in de inputs.")
 
@@ -1458,9 +1395,10 @@ if run_button:
             outputs_zip = None
             with tempfile.TemporaryDirectory() as tmpd:
                 tmp_dir = Path(tmpd)
-                df_Q.to_csv(tmp_dir / "catchment_discharges.csv", index=False)
-                df_H.to_csv(tmp_dir / "catchment_waterlevels.csv", index=False)
-                rf_fname = f"rainfall_waterinfo_dt{int(timestep_minutes)}min.csv"
+                df_Q.to_csv(tmp_dir / "catchment_discharges_m3s.csv", index=False)
+                df_H.to_csv(tmp_dir / "catchment_waterlevels_m_taw.csv", index=False)
+                df_summary.to_csv(tmp_dir / "catchment_summary.csv", index=False)
+                rf_fname = f"rainfall_normalized_dt{int(timestep_minutes)}min.csv"
                 df_rf.to_csv(tmp_dir / rf_fname, index=False)
 
                 depth_files: List[Path] = []
@@ -1476,10 +1414,11 @@ if run_button:
                         reservoirs[cid].export_waterdepth(fp, Hmax)
                         depth_files.append(fp)
 
-                zip_fp = tmp_dir / f"hogebeek_outputs_waterinfo_dt{int(timestep_minutes)}min_max3days.zip"
+                zip_fp = tmp_dir / f"hogebeek_outputs_dt{int(timestep_minutes)}min_max3days.zip"
                 with zipfile.ZipFile(zip_fp, "w", zipfile.ZIP_DEFLATED) as zf:
-                    zf.write(tmp_dir / "catchment_discharges.csv", "catchment_discharges.csv")
-                    zf.write(tmp_dir / "catchment_waterlevels.csv", "catchment_waterlevels.csv")
+                    zf.write(tmp_dir / "catchment_discharges_m3s.csv", "catchment_discharges_m3s.csv")
+                    zf.write(tmp_dir / "catchment_waterlevels_m_taw.csv", "catchment_waterlevels_m_taw.csv")
+                    zf.write(tmp_dir / "catchment_summary.csv", "catchment_summary.csv")
                     zf.write(tmp_dir / rf_fname, rf_fname)
                     if export_depths:
                         for fp in depth_files:
